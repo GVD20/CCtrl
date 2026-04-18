@@ -1,0 +1,10 @@
+{
+    "name": "WouoUiLiteGeneralBridge",
+    "version": "1.0.0",
+    "build": {
+        "srcFilter": "+<*>"
+    },
+    "dependencies": {
+        "WouoUiLiteGeneralOfficial": "*"
+    }
+}

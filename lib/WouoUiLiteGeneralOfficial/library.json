@@ -1,0 +1,10 @@
+{
+    "name": "WouoUiLiteGeneralOfficial",
+    "version": "1.0.0",
+    "build": {
+        "srcFilter": "+<*>"
+    },
+    "dependencies": {
+        "olikraus/U8g2": "^2.36.4"
+    }
+}

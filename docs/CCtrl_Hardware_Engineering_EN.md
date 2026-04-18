@@ -1,4 +1,4 @@
-# CCtrl Hardware Engineering Open Data
+# CCtrl Hardware Engineering
 
 [ZHCN](CCtrl_Hardware_Engineering_ZHCN.md) | [EN](CCtrl_Hardware_Engineering_EN.md)
 

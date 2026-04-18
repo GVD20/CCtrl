@@ -1,4 +1,4 @@
-# CCtrl 调试工具开源数据
+# CCtrl 调试工具
 
 [ZHCN](CCtrl_Debug_Tools_ZHCN.md) | [EN](CCtrl_Debug_Tools_EN.md)
 

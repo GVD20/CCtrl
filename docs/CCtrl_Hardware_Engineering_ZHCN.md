@@ -1,4 +1,4 @@
-# CCtrl 硬件工程资料开源数据
+# CCtrl 硬件工程资料
 
 [ZHCN](CCtrl_Hardware_Engineering_ZHCN.md) | [EN](CCtrl_Hardware_Engineering_EN.md)
 

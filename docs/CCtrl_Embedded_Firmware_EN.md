@@ -1,4 +1,4 @@
-# CCtrl Embedded Firmware Open Data
+# CCtrl Embedded Firmware
 
 [ZHCN](CCtrl_Embedded_Firmware_ZHCN.md) | [EN](CCtrl_Embedded_Firmware_EN.md)
 

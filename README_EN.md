@@ -14,7 +14,9 @@
   <img alt="Output" src="https://img.shields.io/badge/Output-RS232%20%7C%20USB-7A3CF0?style=for-the-badge">
 </p>
 
-![CCtrl Render](hardware/mechanical/renders/CCtrl_Render_Cover.png)
+<p align="center">
+  <img alt="CCtrl Render" src="hardware/mechanical/renders/CCtrl_Render_Cover.png">
+</p>
 
 CCtrl is a spatial controller project for 3D orientation and position interaction. This repository includes embedded firmware, hardware design assets, mechanical models, and host-side tooling for reproduction and customization.
 

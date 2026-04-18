@@ -14,7 +14,9 @@
   <img alt="Output" src="https://img.shields.io/badge/Output-RS232%20%7C%20USB-7A3CF0?style=for-the-badge">
 </p>
 
-![CCtrl 模型效果图](hardware/mechanical/renders/CCtrl_Render_Cover.png)
+<p align="center">
+  <img alt="CCtrl 模型效果图" src="hardware/mechanical/renders/CCtrl_Render_Cover.png">
+</p>
 
 CCtrl 是一个面向三维姿态与空间位移交互的空间控制器项目。本仓库包含嵌入式固件、硬件工程资料、机械模型与调试工具，提供复现和二次修改所需内容。
 

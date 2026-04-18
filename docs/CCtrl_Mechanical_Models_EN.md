@@ -1,4 +1,4 @@
-# CCtrl Mechanical Models Open Data
+# CCtrl Mechanical Models
 
 [ZHCN](CCtrl_Mechanical_Models_ZHCN.md) | [EN](CCtrl_Mechanical_Models_EN.md)
 

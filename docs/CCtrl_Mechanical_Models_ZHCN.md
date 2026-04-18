@@ -1,4 +1,4 @@
-# CCtrl 机械模型开源数据
+# CCtrl 机械模型
 
 [ZHCN](CCtrl_Mechanical_Models_ZHCN.md) | [EN](CCtrl_Mechanical_Models_EN.md)
 

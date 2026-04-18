@@ -1,4 +1,4 @@
-# CCtrl Debug Tools Open Data
+# CCtrl Debug Tools
 
 [ZHCN](CCtrl_Debug_Tools_ZHCN.md) | [EN](CCtrl_Debug_Tools_EN.md)
 

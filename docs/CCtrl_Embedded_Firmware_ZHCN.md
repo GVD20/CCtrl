@@ -1,4 +1,4 @@
-# CCtrl 嵌入式固件开源数据
+# CCtrl 嵌入式固件
 
 [ZHCN](CCtrl_Embedded_Firmware_ZHCN.md) | [EN](CCtrl_Embedded_Firmware_EN.md)
 

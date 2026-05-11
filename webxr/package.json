@@ -1,0 +1,23 @@
+{
+  "name": "quest3-webxr-controller-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "certs:generate": "node scripts/generate-dev-certs.mjs",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "server": "node server/index.mjs",
+    "serve": "node server/index.mjs --serve-dist"
+  },
+  "dependencies": {
+    "three": "^0.176.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.176.0",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.19"
+  }
+}

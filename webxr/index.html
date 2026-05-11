@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>CCtrl XR-Web 控制台</title>
+  <script>
+    window.__WEBXR_CONFIG__ = {
+      WS_URL: "",
+      SEND_HZ: 60
+    };
+  </script>
+</head>
+
+<body>
+  <div id="app">
+    <section class="hud">
+      <div class="hud__card">
+        <p class="hud__eyebrow">CCtrl XR-Web</p>
+        <h1>Quest 3 XR 控制台</h1>
+        <p class="hud__body">
+        </p>
+        <div class="hud__actions">
+          <button id="xr-enter" class="hud__button" type="button">正在检测 XR…</button>
+        </div>
+        <dl class="hud__stats">
+          <div>
+            <dt>XR</dt>
+            <dd id="xr-status">正在检测支持情况…</dd>
+          </div>
+          <div>
+            <dt>Socket</dt>
+            <dd id="socket-status">正在连接…</dd>
+          </div>
+          <div>
+            <dt>模式</dt>
+            <dd id="mode-status">桌面预览</dd>
+          </div>
+          <div>
+            <dt>发送频率</dt>
+            <dd id="send-hz-status">60</dd>
+          </div>
+        </dl>
+        <pre id="last-frame" class="hud__frame">等待控制器数据…</pre>
+      </div>
+    </section>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+
+</html>

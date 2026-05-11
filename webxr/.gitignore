@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+certs/
+.webxr_link_state.json

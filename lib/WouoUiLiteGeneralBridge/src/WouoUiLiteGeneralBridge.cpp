@@ -24,4 +24,12 @@ void tick() {
   WouoUiLiteGeneralOfficial::loop();
 }
 
+bool xrStatusTick(const char *title, const char *line1, const char *line2,
+                  const char *line3) {
+  if (!gStarted) {
+    begin();
+  }
+  return WouoUiLiteGeneralOfficial::xrStatusTick(title, line1, line2, line3);
+}
+
 } // namespace WouoUiLiteGeneral

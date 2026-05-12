@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -25,6 +26,33 @@ try:
 except ImportError:
     serial = None
     list_ports = None
+
+try:
+    from pyfiglet import Figlet
+    from rich.align import Align
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.screen import ModalScreen
+    from textual.widgets import (
+        Button,
+        Footer,
+        Header,
+        Label,
+        LoadingIndicator,
+        OptionList,
+        RichLog,
+        Static,
+    )
+    from textual.widgets.option_list import Option
+
+    UI_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as exc:
+    UI_IMPORT_ERROR = exc
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -70,12 +98,6 @@ class BridgeSnapshot:
     client_connected: bool = False
     bridge_host: str = DEFAULT_BRIDGE_HOST
     bridge_port: int = DEFAULT_BRIDGE_PORT
-    frames_received: int = 0
-    frames_forwarded: int = 0
-    receive_rate_hz: float = 0.0
-    forward_rate_hz: float = 0.0
-    last_seq: int = 0
-    last_packet_age_ms: int = 0
     last_error: str = ""
     xr_status: XrDeviceStatus = field(default_factory=XrDeviceStatus)
     xr_lines: List[str] = field(default_factory=list)
@@ -110,7 +132,6 @@ class CertStatus:
 @dataclass
 class WebServiceStatus:
     running: bool = False
-    transport: str = "stopped"
     serve_dist: bool = False
     clients: int = 0
     active_sessions: int = 0
@@ -118,14 +139,6 @@ class WebServiceStatus:
     bridge_connected: bool = False
     bridge_host: str = DEFAULT_BRIDGE_HOST
     bridge_port: int = DEFAULT_BRIDGE_PORT
-    bridge_age_ms: int = 0
-    bridge_last_seq: int = 0
-    frames_received: int = 0
-    frames_relayed: int = 0
-    frames_dropped_seq: int = 0
-    bridge_write_errors: int = 0
-    receive_rate_hz: float = 0.0
-    relay_rate_hz: float = 0.0
     latest_frame: Dict[str, object] = field(default_factory=dict)
     last_error: str = ""
 
@@ -136,7 +149,14 @@ class GnirehtetStatus:
     device_serial: str = ""
     device_model: str = ""
     last_error: str = ""
-    last_log: str = ""
+
+
+@dataclass
+class DashboardBundle:
+    bridge: BridgeSnapshot
+    gnirehtet: GnirehtetStatus
+    web: WebServiceStatus
+    cert: CertStatus
 
 
 def normalize_text(value: str) -> str:
@@ -600,12 +620,6 @@ class XrUartBridgeManager:
         self._packet_queue: Deque[Tuple[bytes, int]] = deque(maxlen=8)
         self._pending_packet = b""
         self._pending_seq = 0
-        self._frames_received = 0
-        self._frames_forwarded = 0
-        self._last_seq = 0
-        self._last_packet_at = 0.0
-        self._rx_times: Deque[float] = deque(maxlen=300)
-        self._tx_times: Deque[float] = deque(maxlen=300)
 
     def is_running(self) -> bool:
         with self._lock:
@@ -750,9 +764,6 @@ class XrUartBridgeManager:
 
     def snapshot(self) -> BridgeSnapshot:
         with self._lock:
-            age_ms = 0
-            if self._last_packet_at > 0:
-                age_ms = int(max(0.0, (time.time() - self._last_packet_at) * 1000.0))
             return BridgeSnapshot(
                 running=self._running,
                 serial_port=self._serial_port,
@@ -761,25 +772,10 @@ class XrUartBridgeManager:
                 client_connected=self._client_connected,
                 bridge_host=self._bridge_host,
                 bridge_port=self._bridge_port,
-                frames_received=self._frames_received,
-                frames_forwarded=self._frames_forwarded,
-                receive_rate_hz=self._rate_hz(list(self._rx_times)),
-                forward_rate_hz=self._rate_hz(list(self._tx_times)),
-                last_seq=self._last_seq,
-                last_packet_age_ms=age_ms,
                 last_error=self._last_error,
                 xr_status=XrDeviceStatus(**vars(self._xr_status)),
                 xr_lines=list(self._xr_lines),
             )
-
-    @staticmethod
-    def _rate_hz(values: List[float]) -> float:
-        if len(values) < 2:
-            return 0.0
-        dt = values[-1] - values[0]
-        if dt <= 1e-6:
-            return 0.0
-        return (len(values) - 1) / dt
 
     def _record_xr_line(self, line: str) -> None:
         status = parse_xr_status_line(line)
@@ -863,10 +859,7 @@ class XrUartBridgeManager:
         try:
             ser.write(packet)
             ser.flush()
-            now = time.time()
             with self._lock:
-                self._frames_forwarded += 1
-                self._tx_times.append(now)
                 self._pending_packet = b""
                 self._pending_seq = 0
         except Exception as exc:
@@ -897,12 +890,7 @@ class XrUartBridgeManager:
                 with self._lock:
                     self._last_error = "XR 二进制包格式错误"
                 continue
-            now = time.time()
             with self._lock:
-                self._frames_received += 1
-                self._last_seq = int(seq)
-                self._last_packet_at = now
-                self._rx_times.append(now)
                 self._packet_queue.append((packet, int(seq)))
 
     def _tx_loop(self) -> None:
@@ -1012,7 +1000,6 @@ class WebServiceManager:
         self._lock = threading.Lock()
         self._process: Optional[subprocess.Popen[str]] = None
         self._reader_thread: Optional[threading.Thread] = None
-        self._log_lines: Deque[str] = deque(maxlen=200)
         self._last_error = ""
         self._node_path = resolve_node_executable()
         self._npm_path = resolve_npm_executable()
@@ -1020,14 +1007,6 @@ class WebServiceManager:
     def _set_error(self, message: str) -> None:
         with self._lock:
             self._last_error = message
-
-    def _append_log(self, line: str) -> None:
-        with self._lock:
-            self._log_lines.append(line.rstrip())
-
-    def recent_logs(self) -> List[str]:
-        with self._lock:
-            return list(self._log_lines)
 
     def last_error(self) -> str:
         with self._lock:
@@ -1100,7 +1079,6 @@ class WebServiceManager:
         with self._lock:
             self._process = process
             self._last_error = ""
-            self._log_lines.clear()
 
         self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader_thread.start()
@@ -1129,8 +1107,8 @@ class WebServiceManager:
         if process is None or process.stdout is None:
             return
         try:
-            for line in process.stdout:
-                self._append_log(line)
+            for _line in process.stdout:
+                pass
         finally:
             code = process.poll()
             if code not in (None, 0):
@@ -1153,7 +1131,6 @@ class WebServiceManager:
 
         try:
             _url, payload = probe_local_status(self._http_port)
-            status.transport = str(payload.get("transport", "unknown"))
             status.serve_dist = bool(payload.get("serveDist", False))
             status.clients = int(payload.get("clients", 0) or 0)
             status.active_sessions = int(payload.get("activeSessions", 0) or 0)
@@ -1163,14 +1140,6 @@ class WebServiceManager:
                 status.bridge_connected = bool(relay.get("bridgeConnected", False))
                 status.bridge_host = str(relay.get("bridgeHost", status.bridge_host) or status.bridge_host)
                 status.bridge_port = int(relay.get("bridgePort", status.bridge_port) or status.bridge_port)
-                status.bridge_age_ms = int(relay.get("bridgeAgeMs", 0) or 0)
-                status.bridge_last_seq = int(relay.get("bridgeLastSeq", 0) or 0)
-                status.frames_received = int(relay.get("framesReceived", 0) or 0)
-                status.frames_relayed = int(relay.get("framesRelayed", 0) or 0)
-                status.frames_dropped_seq = int(relay.get("framesDroppedSeq", 0) or 0)
-                status.bridge_write_errors = int(relay.get("bridgeWriteErrors", 0) or 0)
-                status.receive_rate_hz = float(relay.get("receiveRateHz", 0.0) or 0.0)
-                status.relay_rate_hz = float(relay.get("relayRateHz", 0.0) or 0.0)
                 latest = relay.get("latestFrame", {})
                 status.latest_frame = latest if isinstance(latest, dict) else {}
                 status.last_error = str(relay.get("lastBridgeError", "") or status.last_error)
@@ -1179,7 +1148,8 @@ class WebServiceManager:
             if isinstance(urls, list) and urls:
                 status.access_urls = [str(item) for item in urls if item]
             else:
-                scheme = "https" if status.transport.startswith("https") else "http"
+                cert_status = collect_cert_status()
+                scheme = "https" if cert_status.https_ready else "http"
                 status.access_urls = build_access_urls(self._http_port, scheme)
         except Exception as exc:
             status.last_error = str(exc)
@@ -1194,7 +1164,6 @@ class GnirehtetManager:
         self._lock = threading.Lock()
         self._process: Optional[subprocess.Popen[str]] = None
         self._thread: Optional[threading.Thread] = None
-        self._log_lines: Deque[str] = deque(maxlen=120)
         self._last_error = ""
         self._device: Optional[AndroidDeviceInfo] = None
         self._stop_requested = False
@@ -1204,10 +1173,6 @@ class GnirehtetManager:
     def _set_error(self, message: str) -> None:
         with self._lock:
             self._last_error = message
-
-    def _append_log(self, line: str) -> None:
-        with self._lock:
-            self._log_lines.append(line.rstrip())
 
     def _ensure_adb(self) -> Tuple[bool, str]:
         if self._adb_path:
@@ -1291,7 +1256,6 @@ class GnirehtetManager:
         with self._lock:
             self._process = process
             self._thread = threading.Thread(target=self._wait_process, daemon=True)
-            self._log_lines.clear()
             self._last_error = ""
             self._device = device
             self._stop_requested = False
@@ -1327,8 +1291,8 @@ class GnirehtetManager:
             return
 
         try:
-            for line in process.stdout:
-                self._append_log(line)
+            for _line in process.stdout:
+                pass
         finally:
             code = process.poll()
             with self._lock:
@@ -1339,13 +1303,11 @@ class GnirehtetManager:
     def status(self) -> GnirehtetStatus:
         with self._lock:
             device = self._device
-            last_log = self._log_lines[-1] if self._log_lines else ""
             return GnirehtetStatus(
                 running=self._process is not None and self._process.poll() is None,
                 device_serial=device.serial if device else "",
                 device_model=device.model if device else "",
                 last_error=self._last_error,
-                last_log=last_log,
             )
 
 
@@ -1368,360 +1330,797 @@ def collect_cert_status() -> CertStatus:
     )
 
 
-class WebXRLinkApp:
-    def __init__(self, args: argparse.Namespace) -> None:
-        runtime_config = load_runtime_config()
-        self._baud = int(args.baud)
-        self._preferred_serial_port = str(args.serial_port or "")
-        self._preferred_android_serial = str(args.android_serial or "")
-        self._bridge_host = str(runtime_config.get("bridgeHost", DEFAULT_BRIDGE_HOST) or DEFAULT_BRIDGE_HOST)
-        self._bridge_port = int(runtime_config.get("bridgePort", DEFAULT_BRIDGE_PORT) or DEFAULT_BRIDGE_PORT)
-        self._http_port = int(args.http_port)
-        self._skip_cleanup = bool(args.skip_cleanup)
+TITLE_TEXT = "CC-BRIDGE"
+SUBTITLE_TEXT = "适用于CCtrl的WebXR桥接工具"
+TITLE_GRADIENT = ("#7dd3fc", "#38bdf8", "#22c55e", "#f59e0b", "#f472b6")
 
-        self._bridge = XrUartBridgeManager()
-        self._web_service = WebServiceManager(self._http_port)
-        self._gnirehtet = GnirehtetManager()
-        self._shutdown_started = False
 
-    def run(self) -> None:
-        print("WebXR Link CLI")
-        print(f"Workspace: {REPO_ROOT}")
-        print(f"Bridge: {self._bridge_host}:{self._bridge_port}    HTTP Port: {self._http_port}")
-        print(f"Platform: {sys.platform}")
+def format_xr_status(status: XrDeviceStatus) -> str:
+    return (
+        f"XR mode={status.mode} requested={int(status.requested)} "
+        f"link={int(status.link_active)} pose={int(status.has_pose)} "
+        f"restore={int(status.restore_pending)} seq={status.seq} age={status.age_ms} ms"
+    )
 
-        if not self._skip_cleanup:
-            print_step(0, 4, "残留进程清理")
-            killed = cleanup_residual_processes()
-            if killed:
-                print_note("已关闭以下残留进程:")
-                for entry in killed:
-                    print(f"  - {entry}")
+
+def build_gradient_figlet(title: str) -> Text:
+    figlet = Figlet(font="slant", width=160)
+    rendered = figlet.renderText(title).rstrip("\n")
+    glyph_count = sum(1 for char in rendered if char != " ")
+    glyph_index = 0
+    rich_text = Text()
+
+    palette = list(TITLE_GRADIENT)
+    palette_size = len(palette) - 1
+
+    for line_no, line in enumerate(rendered.splitlines()):
+        for char in line:
+            if char == " ":
+                rich_text.append(" ")
+                continue
+            ratio = 0.0 if glyph_count <= 1 else glyph_index / float(glyph_count - 1)
+            slot = min(int(ratio * palette_size), palette_size)
+            rich_text.append(char, style=f"bold {palette[slot]}")
+            glyph_index += 1
+        if line_no != len(rendered.splitlines()) - 1:
+            rich_text.append("\n")
+    return rich_text
+
+
+def build_hero_renderable(bridge_host: str, bridge_port: int, http_port: int) -> Panel:
+    title = Align.center(build_gradient_figlet(TITLE_TEXT))
+    subtitle = Align.center(Text(SUBTITLE_TEXT, style="bold #dbeafe"))
+    meta = Align.center(
+        Text(
+            f"Bridge {bridge_host}:{bridge_port}   |   WebXR {http_port}   |   {sys.platform}",
+            style="#94a3b8",
+        )
+    )
+    return Panel(
+        Group(title, subtitle, meta),
+        border_style="#2563eb",
+        padding=(1, 2),
+    )
+
+
+def build_info_panel(title: str, rows: Sequence[Tuple[str, str]], border_style: str) -> Panel:
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style="bold #e2e8f0", no_wrap=True, width=9)
+    table.add_column(style="#cbd5e1", ratio=1)
+    table.add_column(style="bold #e2e8f0", no_wrap=True, width=9)
+    table.add_column(style="#cbd5e1", ratio=1)
+    for index in range(0, len(rows), 2):
+        left_label, left_value = rows[index]
+        if index + 1 < len(rows):
+            right_label, right_value = rows[index + 1]
+        else:
+            right_label, right_value = "", ""
+        table.add_row(left_label, left_value, right_label, right_value)
+    return Panel(table, title=title, border_style=border_style, padding=(0, 1))
+
+
+def build_url_panel(urls: Sequence[str]) -> Panel:
+    body = Text()
+    if urls:
+        for index, url in enumerate(urls):
+            if index:
+                body.append("\n")
+            body.append("◆ ", style="bold #f59e0b")
+            body.append(url, style="bold #e0f2fe")
+    else:
+        body.append("暂无可用地址", style="#94a3b8")
+    return Panel(body, title="访问地址", border_style="#f59e0b", padding=(0, 1))
+
+
+def build_runtime_panel(step_statuses: Sequence[Tuple[str, str]], current_step: str, busy: bool) -> Panel:
+    icon_map = {
+        "pending": ("○", "#64748b"),
+        "working": ("◉", "#38bdf8"),
+        "done": ("◆", "#22c55e"),
+        "skip": ("◇", "#f59e0b"),
+        "error": ("✕", "#ef4444"),
+    }
+    body = Text()
+    body.append("当前状态: ", style="bold #e2e8f0")
+    body.append(current_step, style="bold #7dd3fc" if busy else "bold #22c55e")
+    body.append("\n")
+    for index, (title, status) in enumerate(step_statuses):
+        icon, color = icon_map.get(status, ("○", "#64748b"))
+        body.append(icon + " ", style=f"bold {color}")
+        body.append(title, style="#e5e7eb")
+        if index != len(step_statuses) - 1:
+            body.append("\n")
+    return Panel(body, title="流程阶段", border_style="#8b5cf6", padding=(0, 1))
+
+
+if UI_IMPORT_ERROR is None:
+
+    class ChoiceScreen(ModalScreen[Optional[str]]):
+        CSS = """
+        ChoiceScreen {
+            align: center middle;
+            background: rgba(2, 6, 23, 0.82);
+        }
+        #choice_dialog {
+            width: 88;
+            height: auto;
+            max-height: 32;
+            background: #0f172a;
+            border: thick #38bdf8;
+            padding: 1 2;
+        }
+        #choice_title {
+            color: #f8fafc;
+            text-style: bold;
+            margin-bottom: 1;
+        }
+        #choice_desc {
+            color: #94a3b8;
+            margin-bottom: 1;
+        }
+        #choice_buttons {
+            margin-top: 1;
+            height: auto;
+        }
+        #choice_buttons Button {
+            width: 1fr;
+            margin-right: 1;
+        }
+        """
+
+        BINDINGS = [Binding("escape", "cancel", "取消")]
+
+        def __init__(
+            self,
+            title: str,
+            description: str,
+            items: Sequence[Tuple[str, str]],
+            *,
+            confirm_label: str = "确认",
+            skip_label: str = "跳过",
+        ) -> None:
+            super().__init__()
+            self._title = title
+            self._description = description
+            self._items = list(items)
+            self._confirm_label = confirm_label
+            self._skip_label = skip_label
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="choice_dialog"):
+                yield Label(self._title, id="choice_title")
+                yield Static(self._description, id="choice_desc")
+                yield OptionList(*[Option(label) for label, _value in self._items], id="choice_options")
+                with Horizontal(id="choice_buttons"):
+                    yield Button(self._confirm_label, id="choice_confirm", variant="primary")
+                    yield Button(self._skip_label, id="choice_skip")
+
+        def on_mount(self) -> None:
+            option_list = self.query_one("#choice_options", OptionList)
+            if self._items:
+                option_list.highlighted = 0
+            option_list.focus()
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+        def _selected_value(self) -> Optional[str]:
+            option_list = self.query_one("#choice_options", OptionList)
+            highlighted = option_list.highlighted
+            if highlighted is None:
+                return None
+            return self._items[highlighted][1]
+
+        def on_option_list_option_selected(self, _event: OptionList.OptionSelected) -> None:
+            self.dismiss(self._selected_value())
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "choice_confirm":
+                self.dismiss(self._selected_value())
             else:
-                print_note("未发现需要清理的残留进程。")
+                self.dismiss(None)
 
-        self._initial_sequence()
-        self._menu_loop()
 
-    def _initial_sequence(self) -> None:
-        self._setup_usb_serial(step_index=1, step_total=4)
-        self._setup_gnirehtet(step_index=2, step_total=4)
-        self._start_web_service(step_index=3, step_total=4)
-        self._check_or_generate_certs(step_index=4, step_total=4)
-        self._print_access_summary()
+    class ConfirmScreen(ModalScreen[bool]):
+        CSS = """
+        ConfirmScreen {
+            align: center middle;
+            background: rgba(2, 6, 23, 0.78);
+        }
+        #confirm_dialog {
+            width: 82;
+            height: auto;
+            background: #0f172a;
+            border: thick #22c55e;
+            padding: 1 2;
+        }
+        #confirm_title {
+            color: #f8fafc;
+            text-style: bold;
+            margin-bottom: 1;
+        }
+        #confirm_message {
+            color: #cbd5e1;
+            margin-bottom: 1;
+        }
+        #confirm_buttons {
+            height: auto;
+        }
+        #confirm_buttons Button {
+            width: 1fr;
+            margin-right: 1;
+        }
+        """
 
-    def _setup_usb_serial(self, *, step_index: int, step_total: int) -> None:
-        print_step(step_index, step_total, "USB串口连接")
-        if serial is None:
-            print_note("缺少 pyserial，已跳过 USB 串口步骤。")
-            return
+        BINDINGS = [Binding("escape", "cancel", "取消")]
 
-        preferred = self._preferred_serial_port
-        self._preferred_serial_port = ""
-        while True:
-            port_info = choose_serial_port(preferred=preferred)
-            preferred = ""
-            if port_info is None:
-                print_note("已跳过 USB 串口连接。")
+        def __init__(
+            self,
+            title: str,
+            message: str,
+            *,
+            confirm_label: str = "确认",
+            cancel_label: str = "跳过",
+        ) -> None:
+            super().__init__()
+            self._title = title
+            self._message = message
+            self._confirm_label = confirm_label
+            self._cancel_label = cancel_label
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="confirm_dialog"):
+                yield Label(self._title, id="confirm_title")
+                yield Static(self._message, id="confirm_message")
+                with Horizontal(id="confirm_buttons"):
+                    yield Button(self._confirm_label, id="confirm_yes", variant="primary")
+                    yield Button(self._cancel_label, id="confirm_no")
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            self.dismiss(event.button.id == "confirm_yes")
+
+
+    class CCBridgeTui(App[None]):
+        CSS = """
+        Screen {
+            background: #060816;
+            color: #e2e8f0;
+        }
+        #root {
+            layout: vertical;
+            height: 1fr;
+        }
+        #hero {
+            height: 12;
+            margin: 0 1 0 1;
+        }
+        #main {
+            layout: horizontal;
+            height: 1fr;
+            margin: 0 1 1 1;
+        }
+        #status_title, #log_title, #action_title {
+            color: #f8fafc;
+            text-style: bold;
+            margin-bottom: 0;
+        }
+        #status_column {
+            width: 5fr;
+            padding-right: 0;
+        }
+        #log_column {
+            width: 4fr;
+            padding: 0 0 0 1;
+        }
+        #action_column {
+            width: 3fr;
+            padding-left: 0;
+        }
+        .status_card {
+            height: auto;
+            margin-bottom: 0;
+        }
+        #event_log {
+            border: round #334155;
+            background: #0b1120;
+            color: #dbeafe;
+            height: 1fr;
+        }
+        #busy_indicator {
+            height: 2;
+            margin-bottom: 0;
+        }
+        #step_status {
+            margin-bottom: 0;
+        }
+        #action_column Button {
+            width: 100%;
+            height: 3;
+            min-height: 3;
+            margin-bottom: 0;
+        }
+        Footer {
+            background: #0f172a;
+        }
+        """
+
+        BINDINGS = [
+            Binding("q", "request_quit", "退出"),
+            Binding("r", "refresh_now", "刷新"),
+        ]
+
+        def __init__(self, args: argparse.Namespace) -> None:
+            super().__init__()
+            runtime_config = load_runtime_config()
+            self._baud = int(args.baud)
+            self._preferred_serial_port = str(args.serial_port or "")
+            self._preferred_android_serial = str(args.android_serial or "")
+            self._bridge_host = str(runtime_config.get("bridgeHost", DEFAULT_BRIDGE_HOST) or DEFAULT_BRIDGE_HOST)
+            self._bridge_port = int(runtime_config.get("bridgePort", DEFAULT_BRIDGE_PORT) or DEFAULT_BRIDGE_PORT)
+            self._http_port = int(args.http_port)
+            self._skip_cleanup = bool(args.skip_cleanup)
+
+            self._bridge = XrUartBridgeManager()
+            self._web_service = WebServiceManager(self._http_port)
+            self._gnirehtet = GnirehtetManager()
+            self._shutdown_started = False
+            self._busy = False
+            self._refreshing = False
+            self._refresh_task: Optional[asyncio.Task[None]] = None
+            self._last_status_poll_at = 0.0
+            self._step_statuses: List[Tuple[str, str]] = []
+            if not self._skip_cleanup:
+                self._step_statuses.append(("残留进程清理", "pending"))
+            self._step_statuses.extend(
+                [
+                    ("USB串口连接", "pending"),
+                    ("gnirehtet连接", "pending"),
+                    ("WebXR服务启动", "pending"),
+                    ("证书检查和生成", "pending"),
+                ]
+            )
+            self._current_step = "等待初始化"
+
+        def compose(self) -> ComposeResult:
+            yield Header(show_clock=True)
+            with Vertical(id="root"):
+                yield Static(build_hero_renderable(self._bridge_host, self._bridge_port, self._http_port), id="hero")
+                with Horizontal(id="main"):
+                    with Vertical(id="status_column"):
+                        yield Label("状态总览", id="status_title")
+                        yield Static(id="usb_card", classes="status_card")
+                        yield Static(id="gnirehtet_card", classes="status_card")
+                        yield Static(id="web_card", classes="status_card")
+                        yield Static(id="cert_card", classes="status_card")
+                        yield Static(id="url_card", classes="status_card")
+                    with Vertical(id="log_column"):
+                        yield Label("事件日志", id="log_title")
+                        yield RichLog(id="event_log", markup=False, wrap=True, auto_scroll=True)
+                    with Vertical(id="action_column"):
+                        yield Label("初始化与控制", id="action_title")
+                        yield LoadingIndicator(id="busy_indicator")
+                        yield Static(id="step_status")
+                        yield Button("重新选择USB串口", id="action_serial", variant="primary")
+                        yield Button("重新连接gnirehtet", id="action_gnirehtet")
+                        yield Button("重启WebXR服务", id="action_web")
+                        yield Button("重新生成证书", id="action_cert")
+                        yield Button("重新执行npm编译", id="action_build")
+                        yield Button("退出", id="action_quit", variant="error")
+            yield Footer()
+
+        async def on_mount(self) -> None:
+            self._busy_indicator = self.query_one("#busy_indicator", LoadingIndicator)
+            self._busy_indicator.display = False
+            await self._refresh_dashboard(force_status_poll=False)
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+            self.run_worker(self._run_initial_sequence(), exclusive=True, group="ccbridge-init")
+
+        async def on_unmount(self) -> None:
+            if self._refresh_task is not None:
+                self._refresh_task.cancel()
+
+        async def _refresh_loop(self) -> None:
+            try:
+                while True:
+                    await asyncio.sleep(1.0)
+                    if not self._busy:
+                        await self._refresh_dashboard(force_status_poll=True)
+            except asyncio.CancelledError:
                 return
 
-            ok, message = self._bridge.start(
-                port_info.device,
-                self._baud,
-                self._bridge_host,
-                self._bridge_port,
-            )
-            if not ok:
-                print_note(f"串口桥启动失败: {message}")
-                if not prompt_yes_no("是否重新选择串口?", True):
-                    return
-                continue
+        def _set_buttons_disabled(self, disabled: bool) -> None:
+            for button_id in (
+                "action_serial",
+                "action_gnirehtet",
+                "action_web",
+                "action_cert",
+                "action_build",
+                "action_quit",
+            ):
+                self.query_one(f"#{button_id}", Button).disabled = disabled
 
+        def _set_busy(self, busy: bool, step: str = "") -> None:
+            self._busy = busy
+            self._busy_indicator.display = busy
+            self._set_buttons_disabled(busy)
+            if step:
+                self._current_step = step
+            self._update_runtime_panel()
+
+        def _write_log(self, message: str, style: str = "#dbeafe") -> None:
+            self.query_one("#event_log", RichLog).write(Text(message, style=style))
+
+        def _log_phase(self, title: str, detail: str = "", *, color: str = "#38bdf8") -> None:
+            marker = Text("◆ ", style=f"bold {color}")
+            marker.append(title, style=f"bold {color}")
+            if detail:
+                marker.append("  ")
+                marker.append(detail, style="#94a3b8")
+            self.query_one("#event_log", RichLog).write(marker)
+
+        def _update_step_state(self, title: str, state: str) -> None:
+            for index, (step_title, _old_state) in enumerate(self._step_statuses):
+                if step_title == title:
+                    self._step_statuses[index] = (step_title, state)
+                    break
+            self._update_runtime_panel()
+
+        def _update_runtime_panel(self) -> None:
+            self.query_one("#step_status", Static).update(
+                build_runtime_panel(self._step_statuses, self._current_step, self._busy)
+            )
+
+        async def _run_blocking(self, step: str, func, *args):
+            self._set_busy(True, step)
+            try:
+                return await asyncio.to_thread(func, *args)
+            finally:
+                self._set_busy(False)
+
+        def _gather_dashboard(self) -> DashboardBundle:
+            return DashboardBundle(
+                bridge=self._bridge.snapshot(),
+                gnirehtet=self._gnirehtet.status(),
+                web=self._web_service.fetch_status(),
+                cert=collect_cert_status(),
+            )
+
+        async def _refresh_dashboard(self, *, force_status_poll: bool) -> None:
+            if self._refreshing:
+                return
+            self._refreshing = True
+            try:
+                if force_status_poll and time.monotonic() - self._last_status_poll_at >= 2.5:
+                    bridge_snapshot = self._bridge.snapshot()
+                    if bridge_snapshot.running and bridge_snapshot.serial_connected:
+                        await asyncio.to_thread(self._bridge.request_status, 0.45)
+                        self._last_status_poll_at = time.monotonic()
+                bundle = await asyncio.to_thread(self._gather_dashboard)
+                self._apply_dashboard(bundle)
+            finally:
+                self._refreshing = False
+
+        def _apply_dashboard(self, bundle: DashboardBundle) -> None:
+            bridge = bundle.bridge
+            bridge_rows = [
+                ("USB", f"{bridge.serial_port or '--'} @ {bridge.serial_baud}" if bridge.running else "未连接"),
+                ("串口桥", "在线" if bridge.serial_connected else "等待"),
+                ("Web桥", "在线" if bridge.client_connected else "等待"),
+                ("XR", format_xr_status(bridge.xr_status)),
+            ]
+            if bridge.last_error:
+                bridge_rows.append(("错误", bridge.last_error))
+            self.query_one("#usb_card", Static).update(build_info_panel("USB / XR-UART", bridge_rows, "#38bdf8"))
+
+            gn = bundle.gnirehtet
+            gn_rows = [
+                ("状态", "运行中" if gn.running else "未连接"),
+                ("设备", gn.device_model or gn.device_serial or "--"),
+            ]
+            if gn.last_error:
+                gn_rows.append(("错误", gn.last_error))
+            self.query_one("#gnirehtet_card", Static).update(build_info_panel("gnirehtet", gn_rows, "#22c55e"))
+
+            web = bundle.web
+            web_rows = [
+                ("状态", "运行中" if web.running else "未运行"),
+                ("客户端", f"{web.clients} clients / {web.active_sessions} sessions"),
+                ("桥接", f"{web.bridge_host}:{web.bridge_port} {'OK' if web.bridge_connected else 'WAIT'}"),
+            ]
+            if web.last_error:
+                web_rows.append(("错误", web.last_error))
+            self.query_one("#web_card", Static).update(build_info_panel("WebXR 服务", web_rows, "#6366f1"))
+
+            cert = bundle.cert
+            cert_state = f"{'可用' if cert.https_ready else '缺失'} / {'可用' if cert.quest_ca_ready else '缺失'}"
+            cert_rows = [
+                ("HTTPS / Quest CA", cert_state),
+                ("证书目录", relpath(CERT_DIR)),
+            ]
+            if cert.missing_paths:
+                cert_rows.append(("缺失项", ", ".join(relpath(path) for path in cert.missing_paths)))
+            self.query_one("#cert_card", Static).update(build_info_panel("证书", cert_rows, "#f59e0b"))
+            self.query_one("#url_card", Static).update(build_url_panel(web.access_urls))
+            self._update_runtime_panel()
+
+        async def _run_initial_sequence(self) -> None:
+            self._log_phase("CC-BRIDGE 已启动", "准备执行初始化向导", color="#7dd3fc")
+            if not self._skip_cleanup:
+                await self._cleanup_step()
+            await self._usb_step(step_label="USB串口连接")
+            await self._gnirehtet_step(step_label="gnirehtet连接")
+            await self._web_step(step_label="WebXR服务启动")
+            await self._cert_step(step_label="证书检查和生成")
+            self._current_step = "初始化完成"
+            self._log_phase("初始化完成", "可以直接从右侧按钮执行后续操作", color="#22c55e")
+            await self._refresh_dashboard(force_status_poll=False)
+
+        async def _cleanup_step(self) -> None:
+            title = "残留进程清理"
+            self._update_step_state(title, "working")
+            killed = await self._run_blocking(title, cleanup_residual_processes)
+            if killed:
+                self._log_phase(title, f"已关闭 {len(killed)} 个残留进程", color="#f59e0b")
+                for entry in killed:
+                    self._write_log(f"  {entry}", style="#94a3b8")
+            else:
+                self._log_phase(title, "未发现需要清理的残留进程", color="#22c55e")
+            self._update_step_state(title, "done")
+
+        async def _select_serial_port(self) -> Optional[SerialPortInfo]:
+            ports = await asyncio.to_thread(list_serial_ports)
+            if not ports:
+                self._write_log("未扫描到可用串口。", style="#fbbf24")
+                return None
+            preferred = self._preferred_serial_port
+            self._preferred_serial_port = ""
+            if preferred:
+                matched = next((port for port in ports if port.device == preferred), None)
+                if matched is not None:
+                    return matched
+                self._write_log(f"预选串口 {preferred} 未找到，将转为手动选择。", style="#fbbf24")
+            items = [(describe_serial_port(port), port.device) for port in ports]
+            selected = await self.push_screen_wait(
+                ChoiceScreen(
+                    "选择 CCtrl USB 串口",
+                    "请选择要连接的 USB 串口，按 Enter 确认，也可以直接双击或回车选中。",
+                    items,
+                    confirm_label="连接",
+                    skip_label="跳过",
+                )
+            )
+            if selected is None:
+                return None
+            return next((port for port in ports if port.device == selected), None)
+
+        def _connect_serial_sync(self, port: SerialPortInfo) -> Tuple[bool, List[str]]:
+            lines: List[str] = []
+            ok, message = self._bridge.start(port.device, self._baud, self._bridge_host, self._bridge_port)
+            if not ok:
+                return False, [message]
             if not self._bridge.wait_for_serial_ready(2.0):
                 snapshot = self._bridge.snapshot()
-                print_note(f"串口连接失败: {snapshot.last_error or '端口未就绪'}")
                 self._bridge.stop()
-                if not prompt_yes_no("是否重新选择串口?", True):
-                    return
-                continue
-
-            print_note(f"串口已连接: {port_info.device} @ {self._baud}")
+                return False, [snapshot.last_error or "端口未就绪"]
+            lines.append(f"串口已连接: {port.device} @ {self._baud}")
             status = self._bridge.request_status(timeout=1.0)
             if status is not None:
-                print_note(self._format_xr_status(status))
+                lines.append(format_xr_status(status))
             ok, message = self._bridge.enter_xr_mode(timeout=2.0)
-            print_note(message)
+            lines.append(message)
             status = self._bridge.request_status(timeout=1.0)
             if ok and status is not None:
-                print_note(self._format_xr_status(status))
-            return
+                lines.append(format_xr_status(status))
+            return ok, lines
 
-    def _setup_gnirehtet(self, *, step_index: int, step_total: int) -> None:
-        print_step(step_index, step_total, "gnirehtet连接")
-        ok, devices_or_message = self._gnirehtet.list_devices()
-        if not ok:
-            print_note(str(devices_or_message))
-            print_note("已跳过 gnirehtet。")
-            return
-
-        devices = [item for item in devices_or_message if item.state == "device"]
-        if not devices:
-            print_note("当前没有处于 device 状态的 Android 设备，已跳过 gnirehtet。")
-            return
-
-        preferred = self._preferred_android_serial
-        self._preferred_android_serial = ""
-        selected: Optional[AndroidDeviceInfo] = None
-        if preferred:
-            selected = next((item for item in devices if item.serial == preferred), None)
-            if selected is None:
-                print_note(f"命令行指定设备 {preferred} 不在当前 adb 设备列表中，将转为手动选择。")
-
-        if selected is None:
-            print_note("可用 Android 设备:")
-            for index, device in enumerate(devices, start=1):
-                print(f"  {index}. {describe_android_device(device)}")
-            print("  0. 跳过")
-            while True:
-                answer = input("请选择要连接 gnirehtet 的设备编号: ").strip()
-                if answer == "0":
-                    print_note("已跳过 gnirehtet。")
-                    return
-                if answer.isdigit():
-                    index = int(answer)
-                    if 1 <= index <= len(devices):
-                        selected = devices[index - 1]
-                        break
-                print("请输入有效编号。")
-
-        assert selected is not None
-        ok, message = self._gnirehtet.start(selected)
-        if ok:
-            print_note(message)
-        else:
-            print_note(f"gnirehtet 启动失败: {message}")
-
-    def _start_web_service(self, *, step_index: int, step_total: int) -> None:
-        print_step(step_index, step_total, "WebXR服务启动")
-        build_first = initial_build_needed()
-        if build_first:
-            print_note("检测到首次启动或 dist 缺失，自动执行 npm run build。")
-        ok, message = self._web_service.start_service(build_first=build_first)
-        if build_first and ok:
-            mark_initial_build_done()
-        if not ok:
-            print_note(f"WebXR 服务启动失败: {message}")
-            return
-        print_note(message)
-        health = self._web_service.fetch_status()
-        if health.access_urls:
-            print_note("当前访问地址:")
-            for url in health.access_urls:
-                print(f"  - {url}")
-
-    def _check_or_generate_certs(self, *, step_index: int, step_total: int) -> None:
-        print_step(step_index, step_total, "证书检查和生成")
-        cert_status = collect_cert_status()
-        self._print_cert_status(cert_status)
-        if cert_status.https_ready and cert_status.quest_ca_ready:
-            return
-
-        if not prompt_yes_no("未检测到完整证书，是否现在生成?", True):
-            print_note("已跳过证书生成。")
-            return
-
-        ok, message = self._web_service.generate_certs()
-        if not ok:
-            print_note(f"证书生成失败: {message}")
-            return
-
-        print_note("证书生成完成。")
-        for line in message.splitlines():
-            print(f"  {line}")
-
-        if self._web_service.is_running():
-            print_note("证书已更新，正在重启 WebXR 服务以启用 HTTPS。")
-            self._web_service.stop_service()
-            ok, restart_message = self._web_service.start_service(build_first=False)
-            if ok:
-                print_note(restart_message)
-            else:
-                print_note(f"WebXR 服务重启失败: {restart_message}")
-
-    def _print_access_summary(self) -> None:
-        health = self._web_service.fetch_status()
-        urls = health.access_urls
-        if not urls:
-            return
-        print("\nWebXR访问地址:")
-        for url in urls:
-            print(f"  - {url}")
-
-    def _menu_loop(self) -> None:
-        while True:
-            self._print_dashboard()
-            answer = input(
-                "\n选择操作 [Enter刷新/1串口/2gnirehtet/3重启服务/4重建证书/5重新编译/6退出]: "
-            ).strip()
-            if answer == "":
-                continue
-            if answer == "1":
-                self._reselect_serial()
-                continue
-            if answer == "2":
-                self._reconnect_gnirehtet()
-                continue
-            if answer == "3":
-                self._restart_web_service()
-                continue
-            if answer == "4":
-                self._regenerate_certs()
-                continue
-            if answer == "5":
-                self._rebuild_frontend()
-                continue
-            if answer == "6":
+        async def _usb_step(self, *, step_label: str) -> None:
+            self._update_step_state(step_label, "working")
+            if serial is None:
+                self._log_phase(step_label, "缺少 pyserial，已跳过", color="#ef4444")
+                self._update_step_state(step_label, "error")
                 return
-            print("请输入有效选项。")
+            while True:
+                port = await self._select_serial_port()
+                if port is None:
+                    self._log_phase(step_label, "用户跳过 USB 串口连接", color="#f59e0b")
+                    self._update_step_state(step_label, "skip")
+                    return
+                ok, lines = await self._run_blocking(step_label, self._connect_serial_sync, port)
+                for line in lines:
+                    self._write_log(line, style="#cbd5e1" if ok else "#fca5a5")
+                if ok:
+                    self._log_phase(step_label, f"{port.device} 已就绪并进入 XR-UART", color="#22c55e")
+                    self._update_step_state(step_label, "done")
+                    await self._refresh_dashboard(force_status_poll=False)
+                    return
+                retry = await self.push_screen_wait(
+                    ConfirmScreen(
+                        "USB 串口连接失败",
+                        "\n".join(lines) + "\n\n是否重新选择串口？",
+                        confirm_label="重试",
+                        cancel_label="跳过",
+                    )
+                )
+                if not retry:
+                    self._log_phase(step_label, "用户在失败后选择跳过", color="#f59e0b")
+                    self._update_step_state(step_label, "skip")
+                    return
 
-    def _refresh_xr_status(self) -> Optional[XrDeviceStatus]:
-        snapshot = self._bridge.snapshot()
-        if not snapshot.running or not snapshot.serial_connected:
-            return snapshot.xr_status
-        return self._bridge.request_status(timeout=0.7) or snapshot.xr_status
-
-    def _print_dashboard(self) -> None:
-        print("\n" + "=" * 72)
-        self._refresh_xr_status()
-        bridge = self._bridge.snapshot()
-        gnirehtet_status = self._gnirehtet.status()
-        web_status = self._web_service.fetch_status()
-        cert_status = collect_cert_status()
-
-        print("USB串口:")
-        if bridge.running:
-            print(
-                f"  - {bridge.serial_port or '--'} @ {bridge.serial_baud}"
-                f" | 串口={'OK' if bridge.serial_connected else 'WAIT'}"
-                f" | Web桥={'OK' if bridge.client_connected else 'WAIT'}"
+        async def _select_android_device(self) -> Optional[AndroidDeviceInfo]:
+            ok, devices_or_message = await self._run_blocking("扫描 Android 设备", self._gnirehtet.list_devices)
+            if not ok:
+                self._write_log(str(devices_or_message), style="#fca5a5")
+                return None
+            devices = [item for item in devices_or_message if item.state == "device"]
+            if not devices:
+                self._write_log("当前没有处于 device 状态的 Android 设备。", style="#fbbf24")
+                return None
+            preferred = self._preferred_android_serial
+            self._preferred_android_serial = ""
+            if preferred:
+                matched = next((device for device in devices if device.serial == preferred), None)
+                if matched is not None:
+                    return matched
+                self._write_log(f"预选设备 {preferred} 未连接，将转为手动选择。", style="#fbbf24")
+            items = [(describe_android_device(device), device.serial) for device in devices]
+            selected = await self.push_screen_wait(
+                ChoiceScreen(
+                    "选择 Android 设备",
+                    "选择要通过 adb + gnirehtet 提供网络的设备。",
+                    items,
+                    confirm_label="连接",
+                    skip_label="跳过",
+                )
             )
-            print(f"  - {self._format_xr_status(bridge.xr_status)}")
-            print(
-                f"  - RX {bridge.receive_rate_hz:.1f} Hz | TX {bridge.forward_rate_hz:.1f} Hz"
-                f" | seq={bridge.last_seq} | age={bridge.last_packet_age_ms} ms"
+            if selected is None:
+                return None
+            return next((device for device in devices if device.serial == selected), None)
+
+        async def _gnirehtet_step(self, *, step_label: str) -> None:
+            self._update_step_state(step_label, "working")
+            device = await self._select_android_device()
+            if device is None:
+                self._log_phase(step_label, "未选择 Android 设备，已跳过", color="#f59e0b")
+                self._update_step_state(step_label, "skip")
+                return
+            ok, message = await self._run_blocking(step_label, self._gnirehtet.start, device)
+            self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase(step_label, message, color="#22c55e" if ok else "#ef4444")
+            self._update_step_state(step_label, "done" if ok else "error")
+            await self._refresh_dashboard(force_status_poll=False)
+
+        async def _web_step(self, *, step_label: str) -> None:
+            self._update_step_state(step_label, "working")
+            build_first = initial_build_needed()
+            if build_first:
+                self._write_log("检测到首次启动或 dist 缺失，将自动执行 npm run build。", style="#fbbf24")
+            ok, message = await self._run_blocking(step_label, self._web_service.start_service, build_first)
+            if build_first and ok:
+                mark_initial_build_done()
+            self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase(step_label, message, color="#22c55e" if ok else "#ef4444")
+            self._update_step_state(step_label, "done" if ok else "error")
+            await self._refresh_dashboard(force_status_poll=False)
+
+        def _generate_certs_and_restart_sync(self) -> Tuple[bool, List[str]]:
+            lines: List[str] = []
+            ok, message = self._web_service.generate_certs()
+            if not ok:
+                return False, [message]
+            lines.extend([line for line in message.splitlines() if line.strip()])
+            if self._web_service.is_running():
+                self._web_service.stop_service()
+                ok, restart_message = self._web_service.start_service(build_first=False)
+                lines.append(restart_message)
+                if not ok:
+                    return False, lines
+            return True, lines
+
+        async def _cert_step(self, *, step_label: str) -> None:
+            self._update_step_state(step_label, "working")
+            cert_status = collect_cert_status()
+            if cert_status.https_ready and cert_status.quest_ca_ready:
+                self._log_phase(step_label, "证书完整，HTTPS 可以直接使用", color="#22c55e")
+                self._update_step_state(step_label, "done")
+                await self._refresh_dashboard(force_status_poll=False)
+                return
+            confirm = await self.push_screen_wait(
+                ConfirmScreen(
+                    "生成 WebXR 证书",
+                    "检测到证书不完整。\n\n是否现在生成或刷新本地 HTTPS 证书？",
+                    confirm_label="生成",
+                    cancel_label="跳过",
+                )
             )
-            if bridge.last_error:
-                print(f"  - last_error: {bridge.last_error}")
-        else:
-            print("  - 未连接")
+            if not confirm:
+                self._log_phase(step_label, "用户跳过证书生成", color="#f59e0b")
+                self._update_step_state(step_label, "skip")
+                await self._refresh_dashboard(force_status_poll=False)
+                return
+            ok, lines = await self._run_blocking(step_label, self._generate_certs_and_restart_sync)
+            for line in lines:
+                self._write_log(line, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase(step_label, "证书生成流程完成" if ok else "证书生成失败", color="#22c55e" if ok else "#ef4444")
+            self._update_step_state(step_label, "done" if ok else "error")
+            await self._refresh_dashboard(force_status_poll=False)
 
-        print("gnirehtet:")
-        if gnirehtet_status.running:
-            label = gnirehtet_status.device_model or gnirehtet_status.device_serial
-            print(f"  - 运行中 | {label}")
-            if gnirehtet_status.last_log:
-                print(f"  - {gnirehtet_status.last_log}")
-        else:
-            print("  - 未连接")
-            if gnirehtet_status.last_error:
-                print(f"  - last_error: {gnirehtet_status.last_error}")
+        async def _reselect_serial_action(self) -> None:
+            if self._bridge.is_running():
+                await self._run_blocking("退出当前 XR-UART 连接", self._bridge.exit_xr_mode, 1.5)
+                await self._run_blocking("关闭当前串口桥", self._bridge.stop)
+            await self._usb_step(step_label="USB串口连接")
 
-        print("WebXR服务:")
-        if web_status.running:
-            print(
-                f"  - 运行中 | transport={web_status.transport} | clients={web_status.clients}"
-                f" | sessions={web_status.active_sessions} | bridge={'OK' if web_status.bridge_connected else 'WAIT'}"
-            )
-            print(
-                f"  - RX {web_status.receive_rate_hz:.1f} Hz | Relay {web_status.relay_rate_hz:.1f} Hz"
-                f" | seq={web_status.bridge_last_seq} | age={web_status.bridge_age_ms} ms"
-            )
-        else:
-            print("  - 未运行")
-        if web_status.last_error:
-            print(f"  - last_error: {web_status.last_error}")
+        async def _reconnect_gnirehtet_action(self) -> None:
+            await self._run_blocking("停止当前 gnirehtet", self._gnirehtet.stop)
+            await self._gnirehtet_step(step_label="gnirehtet连接")
 
-        print("证书:")
-        self._print_cert_status(cert_status, prefix="  - ")
+        async def _restart_web_action(self) -> None:
+            await self._run_blocking("停止 WebXR 服务", self._web_service.stop_service)
+            ok, message = await self._run_blocking("重启 WebXR 服务", self._web_service.start_service, False)
+            self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase("WebXR服务重启", message, color="#22c55e" if ok else "#ef4444")
+            await self._refresh_dashboard(force_status_poll=False)
 
-        print("WebXR访问地址:")
-        if web_status.access_urls:
-            for url in web_status.access_urls:
-                print(f"  - {url}")
-        else:
-            print("  - 无可用地址")
+        async def _regenerate_certs_action(self) -> None:
+            ok, lines = await self._run_blocking("重新生成证书", self._generate_certs_and_restart_sync)
+            for line in lines:
+                self._write_log(line, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase("证书刷新", "完成" if ok else "失败", color="#22c55e" if ok else "#ef4444")
+            await self._refresh_dashboard(force_status_poll=False)
 
-    def _print_cert_status(self, cert_status: CertStatus, prefix: str = "  ") -> None:
-        https_text = "HTTPS可用" if cert_status.https_ready else "HTTPS证书缺失"
-        quest_text = "Quest导入证书可用" if cert_status.quest_ca_ready else "Quest导入证书缺失"
-        print(f"{prefix}{https_text} | {quest_text}")
-        print(f"{prefix}server cert: {relpath(cert_status.server_cert)}")
-        print(f"{prefix}server key : {relpath(cert_status.server_key)}")
-        print(f"{prefix}root cer   : {relpath(cert_status.root_cer)}")
-        if cert_status.missing_paths:
-            print(f"{prefix}missing    : {', '.join(relpath(path) for path in cert_status.missing_paths)}")
+        async def _rebuild_frontend_action(self) -> None:
+            ok, message = await self._run_blocking("执行 npm run build", self._web_service.build_frontend)
+            if ok:
+                mark_initial_build_done()
+            self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase("npm 编译", "完成" if ok else "失败", color="#22c55e" if ok else "#ef4444")
+            await self._refresh_dashboard(force_status_poll=False)
 
-    def _format_xr_status(self, status: XrDeviceStatus) -> str:
-        return (
-            f"XR mode={status.mode} requested={int(status.requested)} "
-            f"link={int(status.link_active)} pose={int(status.has_pose)} "
-            f"restore={int(status.restore_pending)} seq={status.seq} age={status.age_ms} ms"
-        )
+        async def on_button_pressed(self, event: Button.Pressed) -> None:
+            if self._busy:
+                return
+            button_id = event.button.id
+            if button_id == "action_serial":
+                self.run_worker(self._reselect_serial_action(), exclusive=True, group="ccbridge-action")
+            elif button_id == "action_gnirehtet":
+                self.run_worker(self._reconnect_gnirehtet_action(), exclusive=True, group="ccbridge-action")
+            elif button_id == "action_web":
+                self.run_worker(self._restart_web_action(), exclusive=True, group="ccbridge-action")
+            elif button_id == "action_cert":
+                self.run_worker(self._regenerate_certs_action(), exclusive=True, group="ccbridge-action")
+            elif button_id == "action_build":
+                self.run_worker(self._rebuild_frontend_action(), exclusive=True, group="ccbridge-action")
+            elif button_id == "action_quit":
+                await self.action_request_quit()
 
-    def _reselect_serial(self) -> None:
-        if self._bridge.is_running():
-            self._bridge.exit_xr_mode(timeout=1.5)
-            self._bridge.stop()
-        self._setup_usb_serial(step_index=1, step_total=1)
+        async def action_refresh_now(self) -> None:
+            await self._refresh_dashboard(force_status_poll=True)
+            self._log_phase("手动刷新", "面板状态已更新", color="#7dd3fc")
 
-    def _reconnect_gnirehtet(self) -> None:
-        self._gnirehtet.stop()
-        self._setup_gnirehtet(step_index=1, step_total=1)
+        async def action_request_quit(self) -> None:
+            if self._busy:
+                self._write_log("当前有任务在运行，请稍候后再退出。", style="#fbbf24")
+                return
+            await asyncio.to_thread(self.shutdown_services)
+            self.exit()
 
-    def _restart_web_service(self) -> None:
-        self._web_service.stop_service()
-        ok, message = self._web_service.start_service(build_first=False)
-        print_note(message if ok else f"WebXR 服务重启失败: {message}")
-        if ok:
-            self._print_access_summary()
-
-    def _regenerate_certs(self) -> None:
-        ok, message = self._web_service.generate_certs()
-        if not ok:
-            print_note(f"证书生成失败: {message}")
-            return
-        print_note("证书生成完成。")
-        for line in message.splitlines():
-            print(f"  {line}")
-        if self._web_service.is_running():
-            self._restart_web_service()
-
-    def _rebuild_frontend(self) -> None:
-        ok, message = self._web_service.build_frontend()
-        if not ok:
-            print_note(f"npm run build 失败: {message}")
-            return
-        mark_initial_build_done()
-        print_note("npm run build 完成。")
-        if self._web_service.is_running() and prompt_yes_no("是否立即重启 WebXR 服务以加载新 dist?", True):
-            self._restart_web_service()
-
-    def shutdown(self) -> None:
-        if self._shutdown_started:
-            return
-        self._shutdown_started = True
-        print("\n正在退出...")
-        self._web_service.stop_service()
-        if self._bridge.is_running():
-            ok, message = self._bridge.exit_xr_mode(timeout=2.5)
-            print_note(message if ok else f"退出 XR-UART 失败: {message}")
-            self._bridge.stop()
-        self._gnirehtet.stop()
+        def shutdown_services(self) -> None:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+            self._web_service.stop_service()
+            if self._bridge.is_running():
+                self._bridge.exit_xr_mode(timeout=2.5)
+                self._bridge.stop()
+            self._gnirehtet.stop()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="CCtrl WebXR one-stop CLI: USB bridge, gnirehtet, certs, and WebXR service.",
+        description="CCtrl WebXR full-screen bridge CLI powered by Textual, Rich, and PyFiglet.",
     )
     parser.add_argument("--serial-port", default="", help="预选 USB 串口，如 COM6 或 /dev/ttyUSB0")
     parser.add_argument("--android-serial", default="", help="预选 adb 设备序列号")
@@ -1732,9 +2131,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if UI_IMPORT_ERROR is not None:
+        print(
+            "Missing UI dependencies. Install them with: "
+            "python -m pip install textual rich pyfiglet"
+        )
+        print(f"Import error: {UI_IMPORT_ERROR}")
+        return 1
+
     parser = build_parser()
     args = parser.parse_args()
-    app = WebXRLinkApp(args)
+    app = CCBridgeTui(args)
     try:
         app.run()
         return 0
@@ -1742,7 +2149,7 @@ def main() -> int:
         print("\n收到中断，准备退出。")
         return 130
     finally:
-        app.shutdown()
+        app.shutdown_services()
 
 
 if __name__ == "__main__":

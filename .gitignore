@@ -1,6 +1,9 @@
 .pio/
 .pioenvs/
 .piolibdeps/
+.pio_home/
+.pio-core/
+.platformio_local/
 
 .vscode/
 
@@ -21,3 +24,4 @@ src/**/output/
 *.bak
 
 Archive/
+webxr/platform-tools/

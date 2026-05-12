@@ -29,6 +29,7 @@ CCtrl 是一个面向三维姿态与空间位移交互的空间控制器项目�
 | 硬件工程资料 | [CCtrl_Hardware_Engineering_ZHCN](docs/CCtrl_Hardware_Engineering_ZHCN.md) | [CCtrl_Hardware_Engineering_EN](docs/CCtrl_Hardware_Engineering_EN.md) |
 | 机械模型     | [CCtrl_Mechanical_Models_ZHCN](docs/CCtrl_Mechanical_Models_ZHCN.md)       | [CCtrl_Mechanical_Models_EN](docs/CCtrl_Mechanical_Models_EN.md)       |
 | 调试工具     | [CCtrl_Debug_Tools_ZHCN](docs/CCtrl_Debug_Tools_ZHCN.md)                   | [CCtrl_Debug_Tools_EN](docs/CCtrl_Debug_Tools_EN.md)                   |
+| WebXR 工作流 | [webxr/README.md](webxr/README.md)                                         | [webxr/README.md](webxr/README.md)                                     |
 
 <h5>▌项目概览</h5>
 
@@ -50,7 +51,12 @@ CCtrl 是一个面向三维姿态与空间位移交互的空间控制器项目�
 │  ├─ shared/
 │  └─ ui_runtime/
 ├─ tools/
-│  └─ unified_preview_monitor.py
+│  └─ preview_monitor.py
+├─ webxr/
+│  ├─ README.md
+│  ├─ src/
+│  ├─ server/
+│  └─ WebXR_link.py
 ├─ docs/
 ├─ hardware/
 │  ├─ electronics/
@@ -76,11 +82,15 @@ platformio run -e master_esp32s3
 platformio run -e master_esp32s3 -t upload
 ```
 
-<h5>▌上位机预览</h5>
+<h5>▌上位机与 WebXR</h5>
 
 ```bash
-python tools/unified_preview_monitor.py
+python tools/preview_monitor.py
+python webxr/WebXR_link.py
 ```
+
+- `tools/preview_monitor.py`：当前默认桌面监控与 XR-UART 控制台
+- `webxr/README.md`：Quest / WebXR / 本地 HTTPS-WSS 桥接说明
 
 ## PIO 库依赖
 

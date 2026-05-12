@@ -78,11 +78,23 @@ struct UiPopupState {
   char text[32] = {0};
 };
 
+struct XrWebSnapshot {
+  uint8_t enabled = 0;
+  uint8_t hasPose = 0;
+  uint8_t restorePending = 0;
+  uint8_t hostLinked = 0;
+  uint32_t lastPacketSeq = 0;
+  uint32_t lastPacketAgeMs = 0;
+};
+
 namespace MasterBusiness {
 void setup();
 void loop();
 bool getMonitorSnapshot(UiMonitorSnapshot &out);
 bool getUiPopupState(UiPopupState &out);
+bool getXrWebSnapshot(XrWebSnapshot &out);
+bool setXrWebMode(bool enabled);
+bool getXrWebMode();
 
 void startJoystickCalibration();
 void stopJoystickCalibration();
@@ -99,6 +111,10 @@ uint8_t getPoseMode();
 
 bool setRotationOutputMode(uint8_t mode);
 uint8_t getRotationOutputMode();
+
+bool setBootSoundEnabled(bool enabled);
+bool getBootSoundEnabled();
+uint32_t getLinkInitSuccessCount();
 
 bool getEncoderCalibrationState(EncoderCalibrationState &out);
 bool calibrateEncoderAxisToDegree(uint8_t axis, uint16_t degree);

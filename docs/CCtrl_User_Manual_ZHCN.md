@@ -109,15 +109,32 @@ SOF(0xA5)
 
 校准结果由主控保存并参与运行时解算。
 
-## 7. 上位机工具
+## 7. 上位机工具与 XR-UART 工作流
 
-当前仓库保留只读预览工具：
+当前仓库主要有两条上位机入口：
 
 ```bash
-python tools/unified_preview_monitor.py
+python tools/preview_monitor.py
+python webxr/WebXR_link.py
 ```
 
-该工具仅用于数据显示与仿真预览。
+- `tools/preview_monitor.py`
+  - 当前默认桌面监控与 XR-UART 控制台
+  - 可查看串口帧、协议字段、桥接状态、最近一帧摘要
+  - 可进入/退出 XR-UART，并读取本地 WebXR 服务 `/status`
+- `webxr/WebXR_link.py`
+  - 面向 Quest 联调的全屏工作流
+  - 负责 USB 串口切换、ADB 设备发现、`gnirehtet`、证书检查、前端编译和本地服务拉起
+- `webxr/README.md`
+  - 汇总 WebXR 前端、本地 HTTPS/WSS 服务、运行时 `bridgeHost` / `bridgePort` / 倍率配置，以及 Quest 访问方式
+
+当前 WebXR 实现支持：
+
+- 优先 `immersive-ar`，失败时回退 `immersive-vr`
+- 世界空间调试/按键/状态面板
+- 右手控制器姿态、按键、摇杆采样
+- Trigger 映射 `KEY5`
+- 右手手势按键映射 `KEY6` / `KEY7`
 
 ## 8. 构建与烧录
 

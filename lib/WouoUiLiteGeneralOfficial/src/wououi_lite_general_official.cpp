@@ -120,6 +120,8 @@ char monitor_line_link[MONITOR_LINE_BUF] = "- Link:OK Loss:0.0";
 char option_line_if[MONITOR_LINE_BUF] = "- LinkOut: RS232";
 char option_line_pose[MONITOR_LINE_BUF] = "- PoseOut: REL";
 char option_line_rot[MONITOR_LINE_BUF] = "- RotOut: EUL";
+char option_line_boot_snd[MONITOR_LINE_BUF] = "- BootSnd: ON";
+char option_line_xr[MONITOR_LINE_BUF] = "- XR-Web: OFF";
 
 char joycal_line_inst[MONITOR_LINE_BUF] = "- Rotate stick continuously";
 char joycal_line_cur[MONITOR_LINE_BUF] = "- Cur X:050 Y:050";
@@ -156,7 +158,8 @@ M_SELECT knob_menu[]{
 
 M_SELECT krf_menu[]{
     {"[ Options ]"},    {"- Back"},        {option_line_if},
-    {option_line_pose}, {option_line_rot},
+    {option_line_pose}, {option_line_rot}, {option_line_boot_snd},
+    {option_line_xr},
 };
 
 M_SELECT kpf_menu[]{
@@ -546,8 +549,9 @@ void eeprom_init() {
 // 可按下旋钮引脚
 #if defined(ARDUINO_ARCH_ESP32)
 // KEY5=GPIO39(CC), KEY7=GPIO1(CW), KEY6=GPIO40(SP/LP)
-#define AIO 39
-#define BIO 1
+// Swap front/back button semantics by exchanging the quadrature source pins.
+#define AIO 1
+#define BIO 39
 #define SW 40
 #else
 #define AIO PB12
@@ -740,7 +744,7 @@ void ui_param_init() {
   ui.param[LIST_ANI] = 60;  // 列表动画速度
   ui.param[WIN_ANI] = 25;   // 弹窗动画速度
   ui.param[FADE_ANI] = 30;  // 消失动画速度
-  ui.param[BTN_SPT] = 25;   // 按键短按时长
+  ui.param[BTN_SPT] = 100;  // 按键短按时长
   ui.param[BTN_LPT] = 150;  // 按键长按时长
   ui.param[LIST_UFD] = 1;   // 菜单列表从头展开开关
   ui.param[LIST_LOOP] = 0;  // 菜单列表循环模式开关
@@ -1403,6 +1407,8 @@ void options_menu_refresh() {
   const uint8_t outIf = MasterBusiness::getOutputInterface();
   const uint8_t pose = MasterBusiness::getPoseMode();
   const uint8_t rot = MasterBusiness::getRotationOutputMode();
+  const bool bootSnd = MasterBusiness::getBootSoundEnabled();
+  const bool xrMode = MasterBusiness::getXrWebMode();
 
   snprintf(option_line_if, MONITOR_LINE_BUF, "- LinkOut: %s",
            (outIf == MB_OUTPUT_IF_USB) ? "USB" : "RS232");
@@ -1410,6 +1416,10 @@ void options_menu_refresh() {
            (pose == MB_POSE_MODE_ABSOLUTE) ? "ABS" : "REL");
   snprintf(option_line_rot, MONITOR_LINE_BUF, "- RotOut: %s",
            (rot == MB_ROT_OUT_QUATERNION) ? "QUAT" : "EUL");
+  snprintf(option_line_boot_snd, MONITOR_LINE_BUF, "- BootSnd: %s",
+           bootSnd ? "ON" : "OFF");
+  snprintf(option_line_xr, MONITOR_LINE_BUF, "- XR-Web: %s",
+           xrMode ? "ON" : "OFF");
 }
 
 void enc_cali_refresh_lines() {
@@ -1558,6 +1568,13 @@ void krf_proc() {
             (MasterBusiness::getRotationOutputMode() == MB_ROT_OUT_QUATERNION)
                 ? MB_ROT_OUT_EULER
                 : MB_ROT_OUT_QUATERNION);
+        break;
+      case 5:
+        MasterBusiness::setBootSoundEnabled(
+            !MasterBusiness::getBootSoundEnabled());
+        break;
+      case 6:
+        MasterBusiness::setXrWebMode(!MasterBusiness::getXrWebMode());
         break;
       }
     }
@@ -1834,6 +1851,7 @@ void oled_init() {
   u8g2.setBusClock(1000000); // 硬件IIC接口使用
 #endif
   u8g2.begin();
+  u8g2.setDisplayRotation(U8G2_R2);
   u8g2.setContrast(ui.param[DISP_BRI]);
   buf_ptr = u8g2.getBufferPtr();
   buf_len = 8 * u8g2.getBufferTileHeight() * u8g2.getBufferTileWidth();
@@ -1859,10 +1877,77 @@ void wououi_lite_general_loop() {
   ui_proc();
 }
 
+static bool xr_status_tick_impl(const char *title, const char *line1,
+                                const char *line2, const char *line3) {
+  static char lastTitle[24] = {0};
+  static char lastLine1[24] = {0};
+  static char lastLine2[24] = {0};
+  static char lastLine3[24] = {0};
+  static bool firstDraw = true;
+
+  btn_scan();
+  bool exitRequested = false;
+  if (btn.pressed) {
+    if (btn.id == BTN_ID_SP || btn.id == BTN_ID_LP) {
+      exitRequested = true;
+    }
+    btn.pressed = false;
+  }
+
+  auto copyLine = [](char *dst, size_t dstSize, const char *src) {
+    if (!dst || dstSize == 0)
+      return;
+    if (!src)
+      src = "";
+    snprintf(dst, dstSize, "%s", src);
+  };
+
+  char nextTitle[24] = {0};
+  char nextLine1[24] = {0};
+  char nextLine2[24] = {0};
+  char nextLine3[24] = {0};
+  copyLine(nextTitle, sizeof(nextTitle), title ? title : "XR-Web Mode");
+  copyLine(nextLine1, sizeof(nextLine1), line1);
+  copyLine(nextLine2, sizeof(nextLine2), line2);
+  copyLine(nextLine3, sizeof(nextLine3), line3);
+
+  const bool changed =
+      firstDraw || strcmp(lastTitle, nextTitle) != 0 ||
+      strcmp(lastLine1, nextLine1) != 0 || strcmp(lastLine2, nextLine2) != 0 ||
+      strcmp(lastLine3, nextLine3) != 0;
+
+  if (changed) {
+    copyLine(lastTitle, sizeof(lastTitle), nextTitle);
+    copyLine(lastLine1, sizeof(lastLine1), nextLine1);
+    copyLine(lastLine2, sizeof(lastLine2), nextLine2);
+    copyLine(lastLine3, sizeof(lastLine3), nextLine3);
+    firstDraw = false;
+
+    u8g2.clearBuffer();
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.drawStr(2, 11, lastTitle);
+    u8g2.drawHLine(0, 14, DISP_W);
+    u8g2.drawStr(2, 28, lastLine1);
+    u8g2.drawStr(2, 41, lastLine2);
+    u8g2.drawStr(2, 54, lastLine3);
+    u8g2.drawHLine(0, 56, DISP_W);
+    u8g2.drawStr(2, 64, "OK Exit");
+    u8g2.sendBuffer();
+  }
+
+  return exitRequested;
+}
+
 namespace WouoUiLiteGeneralOfficial {
 
 void setup() { wououi_lite_general_setup(); }
 
 void loop() { wououi_lite_general_loop(); }
+
+bool xrStatusTick(const char *title, const char *line1, const char *line2,
+                  const char *line3) {
+  return xr_status_tick_impl(title, line1, line2, line3);
+}
 
 } // namespace WouoUiLiteGeneralOfficial

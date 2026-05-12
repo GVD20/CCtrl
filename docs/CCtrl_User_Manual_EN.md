@@ -108,15 +108,32 @@ Common menu entries:
 
 Calibration results are stored on-device and applied in runtime output.
 
-## 7. Host Tool
+## 7. Host Tools and XR-UART Workflow
 
-The repository keeps one read-only host preview tool:
+The repository currently exposes two main host-side entry points:
 
 ```bash
-python tools/unified_preview_monitor.py
+python tools/preview_monitor.py
+python webxr/WebXR_link.py
 ```
 
-This tool is for data display and simulation preview only.
+- `tools/preview_monitor.py`
+  - current default desktop monitor and XR-UART control surface
+  - shows decoded serial frames, protocol fields, relay state, and the latest frame summary
+  - can enter/exit XR-UART and inspect the local WebXR service `/status`
+- `webxr/WebXR_link.py`
+  - full-screen workflow for Quest bring-up
+  - handles USB serial switching, ADB device discovery, `gnirehtet`, certificate checks, frontend build, and local service start
+- `webxr/README.md`
+  - documents the WebXR frontend, local HTTPS/WSS service, runtime `bridgeHost` / `bridgePort` / scaling config, and Quest access flow
+
+The current WebXR path supports:
+
+- `immersive-ar` first, with `immersive-vr` fallback
+- world-space debug / key / info panels
+- right-controller pose, button, and joystick sampling
+- Trigger mapped to `KEY5`
+- right-hand gesture-generated `KEY6` / `KEY7`
 
 ## 8. Build and Upload
 

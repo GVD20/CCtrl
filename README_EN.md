@@ -29,6 +29,7 @@ CCtrl is a spatial controller project for 3D orientation and position interactio
 | Hardware Engineering | [CCtrl_Hardware_Engineering_ZHCN](docs/CCtrl_Hardware_Engineering_ZHCN.md) | [CCtrl_Hardware_Engineering_EN](docs/CCtrl_Hardware_Engineering_EN.md) |
 | Mechanical Models    | [CCtrl_Mechanical_Models_ZHCN](docs/CCtrl_Mechanical_Models_ZHCN.md)       | [CCtrl_Mechanical_Models_EN](docs/CCtrl_Mechanical_Models_EN.md)       |
 | Debug Tools          | [CCtrl_Debug_Tools_ZHCN](docs/CCtrl_Debug_Tools_ZHCN.md)                   | [CCtrl_Debug_Tools_EN](docs/CCtrl_Debug_Tools_EN.md)                   |
+| WebXR Workflow       | [webxr/README.md](webxr/README.md)                                         | [webxr/README.md](webxr/README.md)                                     |
 
 <h5>▌Highlights</h5>
 
@@ -50,7 +51,12 @@ CCtrl is a spatial controller project for 3D orientation and position interactio
 │  ├─ shared/
 │  └─ ui_runtime/
 ├─ tools/
-│  └─ unified_preview_monitor.py
+│  └─ preview_monitor.py
+├─ webxr/
+│  ├─ README.md
+│  ├─ src/
+│  ├─ server/
+│  └─ WebXR_link.py
 ├─ docs/
 ├─ hardware/
 │  ├─ electronics/
@@ -76,11 +82,15 @@ platformio run -e master_esp32s3
 platformio run -e master_esp32s3 -t upload
 ```
 
-<h5>▌Host Preview Tool</h5>
+<h5>▌Host and WebXR Tooling</h5>
 
 ```bash
-python tools/unified_preview_monitor.py
+python tools/preview_monitor.py
+python webxr/WebXR_link.py
 ```
+
+- `tools/preview_monitor.py`: current desktop monitor and XR-UART control surface
+- `webxr/README.md`: Quest / WebXR / local HTTPS-WSS bridge workflow
 
 <h5>▌PlatformIO Library Dependencies</h5>
 

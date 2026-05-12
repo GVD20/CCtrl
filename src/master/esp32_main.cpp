@@ -5,9 +5,10 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
-#include <WiFi.h>
 
+#include <ctype.h>
 #include <math.h>
+#include <stdarg.h>
 #include <string.h>
 
 // --- UART pins ---
@@ -53,8 +54,15 @@ enum ControllerStatusCode : uint8_t {
 constexpr uint8_t KEY5_MASK = 0x10; // node btn bit0
 
 constexpr uint32_t LOOP_POLL_PERIOD_US = 22222; // 45Hz
-constexpr uint32_t OUTPUT_PERIOD_US = 33333;    // 30Hz
+constexpr uint32_t OUTPUT_PERIOD_US = 34000; // ~29.4Hz
 constexpr uint32_t LINK_TIMEOUT_MS = 500;
+constexpr uint32_t XR_PACKET_MAGIC = 0x31525843u; // "CXR1" little-endian
+constexpr size_t XR_HOST_LINE_MAX = 192;
+
+enum InputSourceMode : uint8_t {
+  INPUT_SOURCE_NODE_CHAIN = 0,
+  INPUT_SOURCE_XR_UART = 1,
+};
 
 #pragma pack(push, 1)
 struct RmFrameHeader {
@@ -90,10 +98,28 @@ struct UnifiedPayload30 {
   // [29] reserved
   uint8_t reserved = 0;
 };
+
+struct XrPosePacketV1 {
+  uint32_t magic = XR_PACKET_MAGIC;
+  uint16_t version = 1;
+  uint16_t flags = 0;
+  uint32_t seq = 0;
+  uint8_t joyX = 50;
+  uint8_t joyY = 50;
+  uint16_t keyFlags = 0;
+  float absPos[3] = {0.0f, 0.0f, 0.0f};
+  float relPos[3] = {0.0f, 0.0f, 0.0f};
+  float absQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+  float relQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+  float absEuler[3] = {0.0f, 0.0f, 0.0f};
+  float relEuler[3] = {0.0f, 0.0f, 0.0f};
+};
 #pragma pack(pop)
 
 static_assert(sizeof(UnifiedPayload30) == RM_DATA_LEN,
               "Unified payload must be exactly 30 bytes");
+static_assert(sizeof(XrPosePacketV1) == 96,
+              "XR pose packet layout changed unexpectedly");
 
 MahonyFilter mahony;
 Preferences prefs;
@@ -122,6 +148,7 @@ static float sDeltaPos[3] = {0.0f, 0.0f, 0.0f};
 static uint8_t sNodeButtons = 0;
 static uint8_t sLocalKeys = 0;
 static uint8_t sKeyFlags = 0;
+static uint8_t sXrKeyFlags = 0;
 static uint8_t sDeltaKey = 0;
 static uint8_t sJoyX = 50;
 static uint8_t sJoyY = 50;
@@ -147,6 +174,7 @@ static int8_t sEncDirs[3] = {1, 1, 1};
 static uint8_t sOutputInterface = MB_OUTPUT_IF_RS232;
 static uint8_t sPoseMode = MB_POSE_MODE_RELATIVE;
 static uint8_t sRotOutputMode = MB_ROT_OUT_EULER;
+static uint8_t sBootSoundEnabled = 1;
 
 static uint32_t sPacketSeq = 0;
 static uint8_t sTxSeq = 0;
@@ -166,6 +194,7 @@ static uint8_t sLastRxSeq = 0;
 static uint32_t sLossWindowPackets = 0;
 static uint32_t sLossWindowMissing = 0;
 static float sLossRate10s = 0.0f;
+static volatile uint32_t sLinkInitSuccessCount = 0;
 
 static portMUX_TYPE sMonitorSnapshotMux = portMUX_INITIALIZER_UNLOCKED;
 static UiMonitorSnapshot sMonitorSnapshot;
@@ -177,6 +206,20 @@ static bool sUiPopupSticky = false;
 static uint32_t sUiPopupExpireMs = 0;
 
 static portMUX_TYPE sConfigMux = portMUX_INITIALIZER_UNLOCKED;
+
+static InputSourceMode sInputSourceMode = INPUT_SOURCE_NODE_CHAIN;
+static bool sXrModeRequested = false;
+static bool sXrRestorePending = false;
+static uint32_t sXrLastPacketSeq = 0;
+static uint32_t sXrLastPacketMs = 0;
+static XrWebSnapshot sXrSnapshot;
+static char sHostLineBuf[XR_HOST_LINE_MAX];
+static size_t sHostLineLen = 0;
+static uint8_t sXrPacketBuf[sizeof(XrPosePacketV1)] = {0};
+static size_t sXrPacketLen = 0;
+static bool sXrPacketSync = false;
+
+static void handleHostCommandLine(const char *line);
 
 static float clampf(float x, float lo, float hi) {
   if (x < lo)
@@ -271,6 +314,53 @@ static void quatToEulerDeg(const float q[4], float &rollDeg, float &pitchDeg,
   yawDeg = yaw * RAD2DEG;
 }
 
+static void resetPoseStateToIdle() {
+  sQuat[0] = 1.0f;
+  sQuat[1] = 0.0f;
+  sQuat[2] = 0.0f;
+  sQuat[3] = 0.0f;
+  sDeltaQuat[0] = 1.0f;
+  sDeltaQuat[1] = 0.0f;
+  sDeltaQuat[2] = 0.0f;
+  sDeltaQuat[3] = 0.0f;
+
+  memset(sAbsEuler, 0, sizeof(sAbsEuler));
+  memset(sDeltaEuler, 0, sizeof(sDeltaEuler));
+  memset(sAbsPos, 0, sizeof(sAbsPos));
+  memset(sDeltaPos, 0, sizeof(sDeltaPos));
+  memset(sEncRaw, 0, sizeof(sEncRaw));
+  memset(sEncCalRaw, 0, sizeof(sEncCalRaw));
+  sEncStatus[0] = 0xFF;
+  sEncStatus[1] = 0xFF;
+  sEncStatus[2] = 0xFF;
+  sWheelPos = 0;
+  sWheelSeq = 0;
+  sHasWheelSeq = false;
+  sNodeButtons = 0;
+  sLocalKeys = 0;
+  sKeyFlags = 0;
+  sXrKeyFlags = 0;
+  sDeltaKey = 0;
+  sJoyX = 50;
+  sJoyY = 50;
+  sHasSample = false;
+  sPrevDeltaPressed = false;
+}
+
+static void sendHostLinef(const char *fmt, ...) {
+  char buf[192];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  Serial.print('\n');
+}
+
+static const char *xrModeName() {
+  return (sInputSourceMode == INPUT_SOURCE_XR_UART) ? "UART" : "NODE";
+}
+
 // IEEE754 float32 -> float16
 static uint16_t floatToHalf(float value) {
   uint32_t bits = 0;
@@ -345,6 +435,8 @@ static uint8_t getRotationOutputModeUnsafe() {
                                                    : MB_ROT_OUT_EULER;
 }
 
+static uint8_t getBootSoundEnabledUnsafe() { return sBootSoundEnabled ? 1 : 0; }
+
 static uint8_t composeStatusErr() {
   uint8_t status = CTRL_STATUS_IDLE;
   if (sDisconnectMode)
@@ -373,6 +465,14 @@ static uint8_t scanLocalKeys() {
 }
 
 static void updateCombinedKeyFlags() {
+  if (sInputSourceMode == INPUT_SOURCE_XR_UART) {
+    sLocalKeys = scanLocalKeys();
+    sNodeButtons = 0;
+    sKeyFlags = (uint8_t)((sXrKeyFlags & 0xF0u) |
+                          ((sXrKeyFlags | sLocalKeys) & 0x0Fu));
+    sDeltaKey = (sKeyFlags & KEY5_MASK) ? 1 : 0;
+    return;
+  }
   sLocalKeys = scanLocalKeys();
   sKeyFlags = (uint8_t)((sLocalKeys & 0x0F) | ((sNodeButtons & 0x0F) << 4));
   sDeltaKey = (sKeyFlags & KEY5_MASK) ? 1 : 0;
@@ -483,6 +583,7 @@ static void loadOutputConfig() {
   uint8_t outIf = prefs.getUChar("out_if", MB_OUTPUT_IF_RS232);
   uint8_t pose = prefs.getUChar("pose_mode", MB_POSE_MODE_RELATIVE);
   uint8_t rot = prefs.getUChar("rot_fmt", MB_ROT_OUT_EULER);
+  uint8_t bootSnd = prefs.getUChar("boot_snd", 1);
   prefs.end();
 
   portENTER_CRITICAL(&sConfigMux);
@@ -492,6 +593,7 @@ static void loadOutputConfig() {
                                               : MB_POSE_MODE_RELATIVE;
   sRotOutputMode =
       (rot == MB_ROT_OUT_QUATERNION) ? MB_ROT_OUT_QUATERNION : MB_ROT_OUT_EULER;
+  sBootSoundEnabled = bootSnd ? 1 : 0;
   portEXIT_CRITICAL(&sConfigMux);
 }
 
@@ -499,17 +601,26 @@ static void saveOutputConfig() {
   uint8_t outIf = MB_OUTPUT_IF_RS232;
   uint8_t pose = MB_POSE_MODE_RELATIVE;
   uint8_t rot = MB_ROT_OUT_EULER;
+  uint8_t bootSnd = 1;
   portENTER_CRITICAL(&sConfigMux);
   outIf = getOutputInterfaceUnsafe();
   pose = getPoseModeUnsafe();
   rot = getRotationOutputModeUnsafe();
+  bootSnd = getBootSoundEnabledUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
 
   prefs.begin("sys_cfg", false);
   prefs.putUChar("out_if", outIf);
   prefs.putUChar("pose_mode", pose);
   prefs.putUChar("rot_fmt", rot);
+  prefs.putUChar("boot_snd", bootSnd);
   prefs.end();
+}
+
+static void resetXrPoseData() {
+  resetPoseStateToIdle();
+  sXrLastPacketSeq = 0;
+  sXrLastPacketMs = 0;
 }
 
 static void fillUnifiedPayload(UnifiedPayload30 &payload) {
@@ -523,6 +634,9 @@ static void fillUnifiedPayload(UnifiedPayload30 &payload) {
   pose = getPoseModeUnsafe();
   rot = getRotationOutputModeUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
+
+  if (sInputSourceMode == INPUT_SOURCE_XR_UART)
+    outIf = MB_OUTPUT_IF_RS232;
 
   payload.statusErr = composeStatusErr();
   payload.keyFlags = (uint16_t)sKeyFlags;
@@ -560,9 +674,15 @@ static void fillUnifiedPayload(UnifiedPayload30 &payload) {
   if (rot == MB_ROT_OUT_QUATERNION)
     payload.modeFlags |= 0x04;
 
-  payload.encRaw[0] = sEncCalRaw[0];
-  payload.encRaw[1] = sEncCalRaw[1];
-  payload.encRaw[2] = sEncCalRaw[2];
+  if (sInputSourceMode == INPUT_SOURCE_XR_UART) {
+    payload.encRaw[0] = 0;
+    payload.encRaw[1] = 0;
+    payload.encRaw[2] = 0;
+  } else {
+    payload.encRaw[0] = sEncCalRaw[0];
+    payload.encRaw[1] = sEncCalRaw[1];
+    payload.encRaw[2] = sEncCalRaw[2];
+  }
   payload.reserved = 0;
 }
 
@@ -601,6 +721,9 @@ static void sendUnifiedFrame() {
   portENTER_CRITICAL(&sConfigMux);
   outIf = getOutputInterfaceUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
+
+  if (sInputSourceMode == INPUT_SOURCE_XR_UART)
+    outIf = MB_OUTPUT_IF_RS232;
 
   if (outIf == MB_OUTPUT_IF_USB)
     Serial.write(frame, off);
@@ -651,7 +774,9 @@ static void publishMonitorSnapshot() {
   snap.joyY = sJoyY;
 
   portENTER_CRITICAL(&sConfigMux);
-  snap.outputInterface = getOutputInterfaceUnsafe();
+  snap.outputInterface = (sInputSourceMode == INPUT_SOURCE_XR_UART)
+                             ? MB_OUTPUT_IF_RS232
+                             : getOutputInterfaceUnsafe();
   snap.poseMode = getPoseModeUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
 
@@ -733,6 +858,7 @@ static bool tryInitHandshake(uint32_t timeoutMs) {
   if (sSystemReady) {
     sLastValidFrameMs = millis();
     sHasLastRxSeq = false;
+    sLinkInitSuccessCount++;
   }
   return sSystemReady;
 }
@@ -743,10 +869,298 @@ static void resetSampleCache() {
   sNodeButtons = 0;
 }
 
+static void refreshXrSnapshot() {
+  memset(&sXrSnapshot, 0, sizeof(sXrSnapshot));
+  sXrSnapshot.enabled = (sInputSourceMode == INPUT_SOURCE_XR_UART) ? 1 : 0;
+  sXrSnapshot.hasPose = sHasSample ? 1 : 0;
+  sXrSnapshot.restorePending = sXrRestorePending ? 1 : 0;
+  sXrSnapshot.hostLinked =
+      (sXrLastPacketMs != 0 &&
+       (uint32_t)(millis() - sXrLastPacketMs) <= LINK_TIMEOUT_MS)
+          ? 1
+          : 0;
+  sXrSnapshot.lastPacketSeq = sXrLastPacketSeq;
+  sXrSnapshot.lastPacketAgeMs =
+      sXrLastPacketMs ? (uint32_t)(millis() - sXrLastPacketMs) : 0;
+}
+
+static void sendXrStatusLine() {
+  refreshXrSnapshot();
+  sendHostLinef(
+      "@XR STATUS mode=%s requested=%u link=%u has_pose=%u restore=%u seq=%lu "
+      "age_ms=%lu",
+      xrModeName(), sXrModeRequested ? 1u : 0u,
+      (unsigned)sXrSnapshot.hostLinked, (unsigned)sXrSnapshot.hasPose,
+      (unsigned)sXrSnapshot.restorePending,
+      (unsigned long)sXrSnapshot.lastPacketSeq,
+      (unsigned long)sXrSnapshot.lastPacketAgeMs);
+}
+
+static void applyXrPosePacket(const XrPosePacketV1 &packet) {
+  sXrLastPacketSeq = packet.seq;
+  sXrLastPacketMs = millis();
+  sLastValidFrameMs = sXrLastPacketMs;
+  sObservedEnc = 0;
+  sObservedHnd = 0;
+  sTopoError = false;
+  sDisconnectMode = false;
+  sDisconnectNodeKnown = false;
+  sDisconnectNodeId = 0xFF;
+  sSystemReady = true;
+  sLastErrFlags = 0;
+
+  if ((packet.flags & 0x0001u) == 0) {
+    return;
+  }
+
+  sHasSample = true;
+  sJoyX = packet.joyX;
+  sJoyY = packet.joyY;
+  sXrKeyFlags = (uint8_t)(packet.keyFlags & 0xFFu);
+  updateCombinedKeyFlags();
+  sWheelPos = 0;
+
+  memcpy(sAbsPos, packet.absPos, sizeof(sAbsPos));
+  memcpy(sDeltaPos, packet.relPos, sizeof(sDeltaPos));
+  memcpy(sQuat, packet.absQuat, sizeof(sQuat));
+  memcpy(sDeltaQuat, packet.relQuat, sizeof(sDeltaQuat));
+  memcpy(sAbsEuler, packet.absEuler, sizeof(sAbsEuler));
+  memcpy(sDeltaEuler, packet.relEuler, sizeof(sDeltaEuler));
+  normalizeQuat(sQuat);
+  normalizeQuat(sDeltaQuat);
+}
+
+static void resetXrSerialParser() {
+  sHostLineLen = 0;
+  sXrPacketLen = 0;
+  sXrPacketSync = false;
+}
+
+static void consumeHostAsciiByte(char ch) {
+  if (sHostLineLen == 0) {
+    if (ch != '@')
+      return;
+    sHostLineBuf[sHostLineLen++] = ch;
+    return;
+  }
+
+  if (ch == '\r')
+    return;
+
+  if (ch == '\n') {
+    sHostLineBuf[sHostLineLen] = '\0';
+    handleHostCommandLine(sHostLineBuf);
+    sHostLineLen = 0;
+    return;
+  }
+
+  if ((unsigned char)ch < 32 || (unsigned char)ch > 126) {
+    sHostLineLen = 0;
+    return;
+  }
+
+  if (sHostLineLen + 1 >= sizeof(sHostLineBuf)) {
+    sHostLineLen = 0;
+    return;
+  }
+
+  sHostLineBuf[sHostLineLen++] = ch;
+}
+
+static void consumeXrPacketByte(uint8_t byteValue) {
+  if (!sXrPacketSync) {
+    sXrPacketBuf[sXrPacketLen++] = byteValue;
+    if (sXrPacketLen >= 4) {
+      uint32_t maybeMagic;
+      memcpy(&maybeMagic, sXrPacketBuf + sXrPacketLen - 4, 4);
+      if (maybeMagic == XR_PACKET_MAGIC) {
+        sXrPacketSync = true;
+        sXrPacketLen = 4;
+        return;
+      }
+      // 没有匹配到完整的CXR1，滑动窗口，丢弃最老的一字节
+      sXrPacketBuf[0] = sXrPacketBuf[1];
+      sXrPacketBuf[1] = sXrPacketBuf[2];
+      sXrPacketBuf[2] = sXrPacketBuf[3];
+      sXrPacketLen = 3;
+    }
+    return;
+  }
+
+  if (sXrPacketLen >= sizeof(sXrPacketBuf)) {
+    // 【修复点 1】：发生缓冲区越界时，仅丢弃错位数据并退出同步状态
+    // 取消原有的 sLastErrFlags = ERR_PARSE;
+    // 赋值，避免下游硬件收到错误码导致归零
+    sXrPacketSync = false;
+    sXrPacketLen = 0;
+    return;
+  }
+
+  sXrPacketBuf[sXrPacketLen++] = byteValue;
+  if (sXrPacketLen < sizeof(XrPosePacketV1))
+    return;
+
+  XrPosePacketV1 packet;
+  memcpy(&packet, sXrPacketBuf, sizeof(packet));
+  sXrPacketSync = false;
+  sXrPacketLen = 0;
+
+  // 1. 基础包头校验 (只能防错包，防不了中途错位)
+  if (packet.magic != XR_PACKET_MAGIC || packet.version != 1) {
+    return;
+  }
+
+  // === 新增：防物理层丢字节的“数学启发式结构校验” ===
+
+  // 启发式校验 A：摇杆物理边界 (正常为 0-100，一旦错位极易读出极大数据)
+  if (packet.joyX > 100 || packet.joyY > 100) {
+    return; // 静默丢弃错位包，维持上一个正常姿态
+  }
+
+  // 启发式校验 B：四元数几何模长校验（最核心的防错位防线）
+  // 正常的四元数模长平方必定在 1.0 附近，错位的乱码大概率为极大、极小或 NaN
+  auto checkQuat = [](const float q[4]) -> bool {
+    float sum = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    return (!isnan(sum) && sum > 0.8f && sum < 1.2f);
+  };
+
+  if (!checkQuat(packet.absQuat) || !checkQuat(packet.relQuat)) {
+    return; // 四元数非规格化，100% 发生了底层通信错位
+  }
+
+  // 启发式校验 C：基础向量非 NaN 校验
+  auto checkVec = [](const float v[3]) -> bool {
+    return (!isnan(v[0]) && !isnan(v[1]) && !isnan(v[2]));
+  };
+
+  if (!checkVec(packet.absPos) || !checkVec(packet.relPos) ||
+      !checkVec(packet.absEuler) || !checkVec(packet.relEuler)) {
+    return;
+  }
+  // ===================================================
+
+  // 只有通过了严格数学属性校验的绝对健康数据，才会放行并刷新全局状态
+  applyXrPosePacket(packet);
+}
+
+static void processHostSerialInput() {
+  int loops = 0;
+  // 限制每次最多处理的字节数，防止长时间阻塞30Hz循环
+  while (Serial.available() > 0 && loops < 128) {
+    int value = Serial.read();
+    loops++;
+    if (value < 0)
+      break;
+
+    uint8_t byteValue = (uint8_t)value;
+    if (sHostLineLen != 0) {
+      consumeHostAsciiByte((char)byteValue);
+      continue;
+    }
+
+    bool allowAsciiStart = (byteValue == (uint8_t)'@');
+    if (allowAsciiStart && sInputSourceMode == INPUT_SOURCE_XR_UART) {
+      // In XR-UART mode, raw pose packets can legitimately contain 0x40
+      // inside the binary payload (for example KEY7 == 0x40). Only treat '@'
+      // as an ASCII command start when the XR packet parser is at a clean
+      // packet boundary, otherwise keep feeding the binary parser.
+      allowAsciiStart = (!sXrPacketSync && sXrPacketLen == 0);
+    }
+
+    if (allowAsciiStart) {
+      consumeHostAsciiByte((char)byteValue);
+      continue;
+    }
+
+    if (sInputSourceMode == INPUT_SOURCE_XR_UART)
+      consumeXrPacketByte(byteValue);
+  }
+}
+
+static void serviceXrTransport() {
+  if (sInputSourceMode != INPUT_SOURCE_XR_UART || !sXrModeRequested)
+    return;
+
+  // 如果超过了LINK_TIMEOUT_MS没有收到新的数据帧，不将标志位置为报错
+  // 这确保了在硬件侧，如果XR端有卡顿，仍然可以不停地以30Hz下发上一个有效值
+  if (sHasSample &&
+      (uint32_t)(millis() - sLastValidFrameMs) > LINK_TIMEOUT_MS) {
+    // 仅仅在这里可以记录一下状态，我们保留sLastErrFlags不被置为ERR_TIMEOUT
+    // 硬件就不会因为收到故障标志而归0
+  }
+}
+
+static bool enterXrWebMode() {
+  sInputSourceMode = INPUT_SOURCE_XR_UART;
+  sXrModeRequested = true;
+  sXrRestorePending = false;
+  sSystemReady = true;
+  sTopoError = false;
+  sDisconnectMode = false;
+  sDisconnectNodeKnown = false;
+  sDisconnectNodeId = 0xFF;
+  sLastErrFlags = 0;
+  resetSampleCache();
+  resetXrPoseData();
+  resetXrSerialParser();
+  setUiPopup("XR-UART ON", false, 1200);
+  sendHostLinef("@XR OK mode=UART");
+  return true;
+}
+
+static bool leaveXrWebMode() {
+  if (sInputSourceMode != INPUT_SOURCE_XR_UART && !sXrModeRequested)
+    return true;
+
+  sXrModeRequested = false;
+  sInputSourceMode = INPUT_SOURCE_NODE_CHAIN;
+  resetXrSerialParser();
+  resetXrPoseData();
+  resetSampleCache();
+  sXrRestorePending = true;
+  sLastErrFlags = 0;
+  sSystemReady = false;
+  sTopoError = false;
+
+  if (tryInitHandshake(300)) {
+    exitDisconnectMode();
+    sXrRestorePending = false;
+  } else {
+    enterDisconnectMode(false, 0xFF);
+  }
+
+  setUiPopup("XR-UART OFF", false, 1200);
+  sendHostLinef("@XR OK mode=NODE");
+  return true;
+}
+
+static void handleHostCommandLine(const char *line) {
+  if (!line || strncmp(line, "@XR ", 4) != 0)
+    return;
+
+  const char *cmd = line + 4;
+  if (strcmp(cmd, "STATUS") == 0) {
+    sendXrStatusLine();
+    return;
+  }
+
+  if (strcmp(cmd, "XR_ON") == 0) {
+    if (!enterXrWebMode())
+      sendHostLinef("@XR ERROR reason=enter_failed");
+    return;
+  }
+
+  if (strcmp(cmd, "XR_OFF") == 0) {
+    if (!leaveXrWebMode())
+      sendHostLinef("@XR ERROR reason=exit_failed");
+    return;
+  }
+
+  sendHostLinef("@XR ERROR reason=unknown_command");
+}
+
 static void master_business_setup() {
   setCpuFrequencyMhz(240);
-  WiFi.mode(WIFI_OFF);
-  btStop();
 
   pinMode(KEY1_PIN, INPUT_PULLUP);
   pinMode(KEY2_PIN, INPUT_PULLUP);
@@ -765,6 +1179,7 @@ static void master_business_setup() {
   loadOutputConfig();
 
   resetSampleCache();
+  resetXrPoseData();
   updateCombinedKeyFlags();
 
   sLastPollUs = micros();
@@ -968,14 +1383,40 @@ static void processValidBusPacket(uint8_t *rxBuf, int rxIdx) {
 }
 
 static void master_business_loop() {
+  processHostSerialInput();
   updateCombinedKeyFlags();
   updateUiPopupState();
+
+  if (sInputSourceMode == INPUT_SOURCE_XR_UART) {
+    serviceXrTransport();
+
+    uint32_t nowUs = micros();
+    if ((uint32_t)(nowUs - sLastOutputUs) >= OUTPUT_PERIOD_US) {
+      sLastOutputUs += OUTPUT_PERIOD_US;
+      if ((uint32_t)(nowUs - sLastOutputUs) >= OUTPUT_PERIOD_US)
+        sLastOutputUs = nowUs;
+      sendUnifiedFrame();
+    }
+
+    // XR-UART模式下，跳过频繁快照上报，也不强行delay
+    static uint32_t sLastSnapshotMs = 0;
+    if (millis() - sLastSnapshotMs >= 200) {
+      publishMonitorSnapshot();
+      sLastSnapshotMs = millis();
+    }
+
+    // 让出一点时间片给后台，但不强制延时1ms，保证30Hz的精准度
+    taskYIELD();
+    return;
+  }
 
   if (sDisconnectMode || !sSystemReady) {
     if ((uint32_t)(millis() - sLastInitRetryMs) >= 500U) {
       sLastInitRetryMs = millis();
-      if (tryInitHandshake(80))
+      if (tryInitHandshake(80)) {
         exitDisconnectMode();
+        sXrRestorePending = false;
+      }
     }
     publishMonitorSnapshot();
     delay(2);
@@ -1127,6 +1568,18 @@ bool getUiPopupState(UiPopupState &out) {
   return out.active != 0;
 }
 
+bool getXrWebSnapshot(XrWebSnapshot &out) {
+  refreshXrSnapshot();
+  out = sXrSnapshot;
+  return out.enabled != 0;
+}
+
+bool setXrWebMode(bool enabled) {
+  return enabled ? enterXrWebMode() : leaveXrWebMode();
+}
+
+bool getXrWebMode() { return sInputSourceMode == INPUT_SOURCE_XR_UART; }
+
 void startJoystickCalibration() {
   sJoyCalActive = true;
   sJoyCalData.minX = 100;
@@ -1250,6 +1703,25 @@ uint8_t getRotationOutputMode() {
   portEXIT_CRITICAL(&sConfigMux);
   return mode;
 }
+
+bool setBootSoundEnabled(bool enabled) {
+  portENTER_CRITICAL(&sConfigMux);
+  sBootSoundEnabled = enabled ? 1 : 0;
+  portEXIT_CRITICAL(&sConfigMux);
+  saveOutputConfig();
+  setUiPopup(enabled ? "Boot snd: ON" : "Boot snd: OFF", false, 1200);
+  return true;
+}
+
+bool getBootSoundEnabled() {
+  uint8_t enabled = 1;
+  portENTER_CRITICAL(&sConfigMux);
+  enabled = getBootSoundEnabledUnsafe();
+  portEXIT_CRITICAL(&sConfigMux);
+  return enabled != 0;
+}
+
+uint32_t getLinkInitSuccessCount() { return sLinkInitSuccessCount; }
 
 bool getEncoderCalibrationState(EncoderCalibrationState &out) {
   out.raw[0] = sEncRaw[0];

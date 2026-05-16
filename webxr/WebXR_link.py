@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 try:
     import serial  # type: ignore
@@ -68,6 +69,25 @@ DEFAULT_BRIDGE_HOST = "127.0.0.1"
 DEFAULT_BRIDGE_PORT = 8791
 XR_UART_PACKET_SIZE = 96
 XR_PACKET_MAGIC = 0x31525843
+XR_PACKET_ABS_POS_OFFSET = 16
+XR_PACKET_REL_POS_OFFSET = 28
+XR_PACKET_VEC3_X_OFFSET = 0
+XR_PACKET_VEC3_Y_OFFSET = 4
+XR_BRIDGE_MAGIC = 0x42525843
+XR_BRIDGE_VERSION = 1
+XR_BRIDGE_HELLO_REQ = 1
+XR_BRIDGE_HELLO_RSP = 2
+XR_BRIDGE_XR_DATA = 3
+XR_BRIDGE_DEVICE_KIND_MASTER = 1
+XR_BRIDGE_CAP_PAYLOAD_96 = 0x01
+XR_BRIDGE_CAP_DELTA_ARBITER = 0x02
+XR_BRIDGE_CAP_CRC16 = 0x04
+XR_BRIDGE_HELLO_SIZE = 8
+XR_BRIDGE_HEADER_SIZE = 12
+XR_BRIDGE_FRAME_OVERHEAD = XR_BRIDGE_HEADER_SIZE + 2
+XR_BRIDGE_MAX_PAYLOAD = XR_UART_PACKET_SIZE
+MB_OUTPUT_IF_RS232 = 0
+MB_OUTPUT_IF_USB = 1
 PROCESS_SCAN_PATTERNS = (
     "webxr/server/index.mjs",
     "webxr/webxr_link.py",
@@ -76,17 +96,27 @@ PROCESS_SCAN_PATTERNS = (
     "tools/rs232_3d_viewer.py",
 )
 
+TUI_SCALE_MIN = 0.65
+TUI_SCALE_MAX = 1.35
+TUI_DENSITY_VALUES = ("compact", "normal", "comfortable")
+
+
+@dataclass(frozen=True)
+class TuiLayoutConfig:
+    scale: float = 1.0
+    density: str = "normal"
+
 
 @dataclass
 class XrDeviceStatus:
-    mode: str = "NODE"
-    requested: bool = False
-    link_active: bool = False
-    has_pose: bool = False
-    restore_pending: bool = False
+    detected: bool = False
+    bridge_ready: bool = False
+    output_if: int = MB_OUTPUT_IF_RS232
+    caps: int = 0
+    payload_len: int = XR_UART_PACKET_SIZE
     seq: int = 0
     age_ms: int = 0
-    raw_line: str = ""
+    raw_info: str = ""
 
 
 @dataclass
@@ -238,6 +268,7 @@ def default_runtime_config() -> Dict[str, object]:
         "bridgePort": DEFAULT_BRIDGE_PORT,
         "positionScale": 1.0,
         "rotationScale": 1.0,
+        "calibrationModeEnabled": False,
     }
 
 
@@ -247,6 +278,235 @@ def load_runtime_config() -> Dict[str, object]:
         raw = load_json_file(RUNTIME_CONFIG_PATH)
         config.update(raw)
     return config
+
+
+def save_runtime_config(config: Dict[str, object]) -> None:
+    merged = default_runtime_config()
+    merged.update(config)
+    RUNTIME_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    save_json_file(RUNTIME_CONFIG_PATH, merged)
+
+
+def clamp_tui_scale(value: object) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(TUI_SCALE_MIN, min(TUI_SCALE_MAX, numeric))
+
+
+def normalize_tui_density(value: object) -> str:
+    density = str(value or "").strip().lower()
+    if density in TUI_DENSITY_VALUES:
+        return density
+    return "normal"
+
+
+def scaled_cells(base: int, scale: float, minimum: int = 1) -> int:
+    return max(minimum, int(round(base * scale)))
+
+
+def resolve_tui_layout(args: argparse.Namespace) -> TuiLayoutConfig:
+    env_scale = os.environ.get("CCWEBXR_TUI_SCALE", "").strip()
+    env_density = os.environ.get("CCWEBXR_TUI_DENSITY", "").strip()
+    terminal_size = shutil.get_terminal_size(fallback=(160, 48))
+
+    density = normalize_tui_density(getattr(args, "ui_density", "") or env_density)
+    scale_source = getattr(args, "ui_scale", None)
+    if scale_source is None and env_scale:
+        scale_source = env_scale
+    scale = clamp_tui_scale(scale_source if scale_source is not None else 1.0)
+
+    if not getattr(args, "ui_density", None) and not env_density:
+        if terminal_size.columns < 150 or terminal_size.lines < 42:
+            density = "compact"
+    if getattr(args, "ui_scale", None) is None and not env_scale:
+        if terminal_size.columns < 125 or terminal_size.lines < 34:
+            scale = clamp_tui_scale(0.85)
+
+    return TuiLayoutConfig(scale=scale, density=density)
+
+
+def build_tui_metrics(config: TuiLayoutConfig) -> Dict[str, int]:
+    base = {
+        "compact": {
+            "choice_width": 72,
+            "choice_max_height": 24,
+            "confirm_width": 68,
+            "hero_height": 8,
+            "hero_margin_x": 0,
+            "main_margin_x": 0,
+            "main_margin_bottom": 0,
+            "log_pad_left": 0,
+            "action_pad_left": 0,
+            "action_button_height": 2,
+            "busy_height": 1,
+        },
+        "normal": {
+            "choice_width": 88,
+            "choice_max_height": 32,
+            "confirm_width": 82,
+            "hero_height": 12,
+            "hero_margin_x": 1,
+            "main_margin_x": 1,
+            "main_margin_bottom": 1,
+            "log_pad_left": 1,
+            "action_pad_left": 0,
+            "action_button_height": 3,
+            "busy_height": 2,
+        },
+        "comfortable": {
+            "choice_width": 96,
+            "choice_max_height": 36,
+            "confirm_width": 90,
+            "hero_height": 14,
+            "hero_margin_x": 1,
+            "main_margin_x": 1,
+            "main_margin_bottom": 1,
+            "log_pad_left": 1,
+            "action_pad_left": 1,
+            "action_button_height": 4,
+            "busy_height": 2,
+        },
+    }[config.density]
+    return {
+        key: scaled_cells(value, config.scale, 0 if key.endswith(("_x", "_bottom", "_left")) else 1)
+        for key, value in base.items()
+    }
+
+
+def build_choice_screen_css(config: TuiLayoutConfig) -> str:
+    metrics = build_tui_metrics(config)
+    return f"""
+        ChoiceScreen {{
+            align: center middle;
+            background: rgba(2, 6, 23, 0.82);
+        }}
+        #choice_dialog {{
+            width: {metrics["choice_width"]};
+            height: auto;
+            max-height: {metrics["choice_max_height"]};
+            background: #0f172a;
+            border: thick #38bdf8;
+            padding: 1 2;
+        }}
+        #choice_title {{
+            color: #f8fafc;
+            text-style: bold;
+            margin-bottom: 1;
+        }}
+        #choice_desc {{
+            color: #94a3b8;
+            margin-bottom: 1;
+        }}
+        #choice_buttons {{
+            margin-top: 1;
+            height: auto;
+        }}
+        #choice_buttons Button {{
+            width: 1fr;
+            margin-right: 1;
+        }}
+        """
+
+
+def build_confirm_screen_css(config: TuiLayoutConfig) -> str:
+    metrics = build_tui_metrics(config)
+    return f"""
+        ConfirmScreen {{
+            align: center middle;
+            background: rgba(2, 6, 23, 0.78);
+        }}
+        #confirm_dialog {{
+            width: {metrics["confirm_width"]};
+            height: auto;
+            background: #0f172a;
+            border: thick #22c55e;
+            padding: 1 2;
+        }}
+        #confirm_title {{
+            color: #f8fafc;
+            text-style: bold;
+            margin-bottom: 1;
+        }}
+        #confirm_message {{
+            color: #cbd5e1;
+            margin-bottom: 1;
+        }}
+        #confirm_buttons {{
+            height: auto;
+        }}
+        #confirm_buttons Button {{
+            width: 1fr;
+            margin-right: 1;
+        }}
+        """
+
+
+def build_app_css(config: TuiLayoutConfig) -> str:
+    metrics = build_tui_metrics(config)
+    return f"""
+        Screen {{
+            background: #060816;
+            color: #e2e8f0;
+        }}
+        #root {{
+            layout: vertical;
+            height: 1fr;
+        }}
+        #hero {{
+            height: {metrics["hero_height"]};
+            margin: 0 {metrics["hero_margin_x"]} 0 {metrics["hero_margin_x"]};
+        }}
+        #main {{
+            layout: horizontal;
+            height: 1fr;
+            margin: 0 {metrics["main_margin_x"]} {metrics["main_margin_bottom"]} {metrics["main_margin_x"]};
+        }}
+        #status_title, #log_title, #action_title {{
+            color: #f8fafc;
+            text-style: bold;
+            margin-bottom: 0;
+        }}
+        #status_column {{
+            width: 5fr;
+            padding-right: 0;
+        }}
+        #log_column {{
+            width: 4fr;
+            padding: 0 0 0 {metrics["log_pad_left"]};
+        }}
+        #action_column {{
+            width: 3fr;
+            padding-left: {metrics["action_pad_left"]};
+        }}
+        .status_card {{
+            height: auto;
+            margin-bottom: 0;
+        }}
+        #event_log {{
+            border: round #334155;
+            background: #0b1120;
+            color: #dbeafe;
+            height: 1fr;
+        }}
+        #busy_indicator {{
+            height: {metrics["busy_height"]};
+            margin-bottom: 0;
+        }}
+        #step_status {{
+            margin-bottom: 0;
+        }}
+        #action_column Button {{
+            width: 100%;
+            height: {metrics["action_button_height"]};
+            min-height: {metrics["action_button_height"]};
+            margin-bottom: 0;
+        }}
+        Footer {{
+            background: #0f172a;
+        }}
+        """
 
 
 def list_ipv4_hosts() -> List[str]:
@@ -284,6 +544,17 @@ def build_access_urls(port: int, scheme: str) -> List[str]:
     return [f"{scheme}://{host}:{port}" for host in list_ipv4_hosts()]
 
 
+def pick_remote_access_url(urls: Sequence[str]) -> Optional[str]:
+    for url in urls:
+        try:
+            host = (urlparse(url).hostname or "").strip().lower()
+        except Exception:
+            continue
+        if host and host not in {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}:
+            return url
+    return None
+
+
 def resolve_executable(local_candidates: Sequence[Path], names: Sequence[str]) -> Optional[str]:
     for candidate in local_candidates:
         if candidate.exists():
@@ -296,15 +567,26 @@ def resolve_executable(local_candidates: Sequence[Path], names: Sequence[str]) -
 
 
 def resolve_node_executable() -> Optional[str]:
+    local: List[Path] = []
+    if os.name == "nt":
+        local.append(WEBXR_DIR / "runtime" / "node" / "node.exe")
+    else:
+        local.append(WEBXR_DIR / "runtime" / "node" / "bin" / "node")
+        local.append(WEBXR_DIR / "runtime" / "node" / "node")
     return resolve_executable(
-        (),
+        local,
         ("node.exe", "node") if os.name == "nt" else ("node",),
     )
 
 
 def resolve_npm_executable() -> Optional[str]:
+    local: List[Path] = []
+    if os.name == "nt":
+        local.append(WEBXR_DIR / "runtime" / "node" / "npm.cmd")
+    else:
+        local.append(WEBXR_DIR / "runtime" / "node" / "bin" / "npm")
     return resolve_executable(
-        (),
+        local,
         ("npm.cmd", "npm") if os.name == "nt" else ("npm",),
     )
 
@@ -380,27 +662,82 @@ def probe_local_status(port: int) -> Tuple[str, Dict[str, object]]:
     raise RuntimeError(last_error)
 
 
-def parse_xr_status_line(line: str) -> Optional[XrDeviceStatus]:
-    text = line.strip()
-    if not text.startswith("@XR STATUS "):
+def rm_crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0x8408
+            else:
+                crc >>= 1
+        crc &= 0xFFFF
+    return crc
+
+
+def build_bridge_frame(frame_type: int, seq: int, payload: bytes = b"") -> bytes:
+    payload = payload or b""
+    header = struct.pack(
+        "<IBBHI",
+        XR_BRIDGE_MAGIC,
+        XR_BRIDGE_VERSION,
+        int(frame_type) & 0xFF,
+        len(payload),
+        int(seq) & 0xFFFFFFFF,
+    )
+    frame_wo_crc = header + payload
+    crc = rm_crc16(frame_wo_crc)
+    return frame_wo_crc + struct.pack("<H", crc)
+
+
+def remap_packet_world_position_for_esp32(packet: bytes) -> bytes:
+    if len(packet) != XR_UART_PACKET_SIZE:
+        return packet
+    try:
+        magic, version, _flags, _seq = struct.unpack_from("<IHHI", packet, 0)
+    except struct.error:
+        return packet
+    if magic != XR_PACKET_MAGIC or version != 1:
+        return packet
+
+    mutable = bytearray(packet)
+    for base_offset in (XR_PACKET_ABS_POS_OFFSET, XR_PACKET_REL_POS_OFFSET):
+        x_offset = base_offset + XR_PACKET_VEC3_X_OFFSET
+        x_value = struct.unpack_from("<f", mutable, x_offset)[0]
+        # Keep one host-side hook for ESP32 world-frame tweaks. The current
+        # contract needs the X axis flipped back to the raw WebXR packet sign.
+        struct.pack_into("<f", mutable, x_offset, x_value)
+    return bytes(mutable)
+
+
+def is_transient_serial_write_error(exc: Exception) -> bool:
+    timeout_type = getattr(serial, "SerialTimeoutException", None) if serial is not None else None
+    if timeout_type is not None and isinstance(exc, timeout_type):
+        return True
+    text = str(exc).strip().lower()
+    return "write timeout" in text or ("timed out" in text and "write" in text)
+
+
+def parse_bridge_hello_payload(payload: bytes, seq: int) -> Optional[XrDeviceStatus]:
+    if len(payload) != XR_BRIDGE_HELLO_SIZE:
         return None
-
-    values: Dict[str, str] = {}
-    for part in text[len("@XR STATUS ") :].split():
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        values[key] = value
-
+    device_kind, output_if, bridge_ready, caps, payload_len, _reserved = struct.unpack(
+        "<BBBBHH", payload
+    )
+    if device_kind != XR_BRIDGE_DEVICE_KIND_MASTER:
+        return None
     return XrDeviceStatus(
-        mode=values.get("mode", "NODE"),
-        requested=values.get("requested", "0") == "1",
-        link_active=values.get("link", "0") == "1",
-        has_pose=values.get("has_pose", "0") == "1",
-        restore_pending=values.get("restore", "0") == "1",
-        seq=int(values.get("seq", "0") or 0),
-        age_ms=int(values.get("age_ms", "0") or 0),
-        raw_line=text,
+        detected=True,
+        bridge_ready=bool(bridge_ready),
+        output_if=int(output_if),
+        caps=int(caps),
+        payload_len=int(payload_len),
+        seq=int(seq),
+        age_ms=0,
+        raw_info=(
+            f"out_if={int(output_if)} ready={int(bool(bridge_ready))} "
+            f"caps=0x{int(caps):02X} payload={int(payload_len)}"
+        ),
     )
 
 
@@ -613,13 +950,49 @@ class XrUartBridgeManager:
         self._last_error = ""
         self._xr_status = XrDeviceStatus()
         self._xr_lines: Deque[str] = deque(maxlen=64)
-        self._xr_line_events: Deque[Tuple[int, str]] = deque(maxlen=64)
-        self._line_event_id = 0
-        self._line_buffer = bytearray()
+        self._status_events: Deque[Tuple[int, XrDeviceStatus]] = deque(maxlen=32)
+        self._status_event_id = 0
         self._packet_buffer = bytearray()
-        self._packet_queue: Deque[Tuple[bytes, int]] = deque(maxlen=8)
+        self._device_buffer = bytearray()
+        self._packet_queue: Deque[bytes] = deque(maxlen=8)
         self._pending_packet = b""
-        self._pending_seq = 0
+        self._next_tx_seq = 1
+        self._need_handshake = True
+        self._last_handshake_sent_at = 0.0
+        self._last_status_received_at = 0.0
+        self._serial_write_failures = 0
+
+    @staticmethod
+    def _quiesce_serial_control_lines(ser: object) -> None:
+        for attr_name in ("dsrdtr", "rtscts", "dtr", "rts"):
+            try:
+                setattr(ser, attr_name, False)
+            except Exception:
+                pass
+        for method_name in ("setDTR", "setRTS"):
+            try:
+                getattr(ser, method_name)(False)
+            except Exception:
+                pass
+
+    def _open_serial_port(self, port: str, baud: int):
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = baud
+        ser.timeout = 0.01
+        ser.write_timeout = 0.5
+        self._quiesce_serial_control_lines(ser)
+        ser.open()
+        self._quiesce_serial_control_lines(ser)
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        try:
+            ser.reset_output_buffer()
+        except Exception:
+            pass
+        return ser
 
     def is_running(self) -> bool:
         with self._lock:
@@ -645,10 +1018,17 @@ class XrUartBridgeManager:
             self._client_connected = False
             self._last_error = ""
             self._packet_buffer.clear()
+            self._device_buffer.clear()
             self._packet_queue.clear()
-            self._line_buffer.clear()
             self._pending_packet = b""
-            self._pending_seq = 0
+            self._xr_status = XrDeviceStatus()
+            self._status_events.clear()
+            self._status_event_id = 0
+            self._next_tx_seq = 1
+            self._need_handshake = True
+            self._last_handshake_sent_at = 0.0
+            self._last_status_received_at = 0.0
+            self._serial_write_failures = 0
 
         self._thread_rx = threading.Thread(target=self._run_loop, daemon=True)
         self._thread_tx = threading.Thread(target=self._tx_loop, daemon=True)
@@ -678,92 +1058,57 @@ class XrUartBridgeManager:
             time.sleep(0.05)
         return self.snapshot().serial_connected
 
-    def send_command(self, line: str) -> bool:
-        payload = (line.rstrip("\r\n") + "\n").encode("ascii", errors="ignore")
+    def status_marker(self) -> int:
         with self._lock:
-            ser = self._serial
-        if ser is None:
-            return False
-        try:
-            ser.write(payload)
-            ser.flush()
-            return True
-        except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-                self._serial_connected = False
-            return False
+            return self._status_event_id
 
-    def line_marker(self) -> int:
-        with self._lock:
-            return self._line_event_id
-
-    def wait_for_line(
+    def wait_for_status(
         self,
-        predicate: Callable[[str], bool],
+        predicate: Callable[[XrDeviceStatus], bool],
         timeout: float,
         *,
         after_id: Optional[int] = None,
-    ) -> Optional[str]:
+    ) -> Optional[XrDeviceStatus]:
         deadline = time.monotonic() + timeout
         with self._condition:
-            start_id = self._line_event_id if after_id is None else after_id
+            start_id = self._status_event_id if after_id is None else after_id
             while True:
-                for event_id, line in self._xr_line_events:
-                    if event_id > start_id and predicate(line):
-                        return line
+                for event_id, status in self._status_events:
+                    if event_id > start_id and predicate(status):
+                        return XrDeviceStatus(**vars(status))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._condition.wait(timeout=remaining)
 
     def request_status(self, timeout: float = 1.5) -> Optional[XrDeviceStatus]:
-        marker = self.line_marker()
-        if not self.send_command("@XR STATUS"):
+        marker = self.status_marker()
+        if not self._send_hello_request():
             return None
-        line = self.wait_for_line(
-            lambda item: item.startswith("@XR STATUS "),
+        return self.wait_for_status(
+            lambda _item: True,
             timeout,
             after_id=marker,
         )
-        if line is None:
-            return None
-        return parse_xr_status_line(line)
 
     def enter_xr_mode(self, timeout: float = 2.0) -> Tuple[bool, str]:
-        marker = self.line_marker()
-        if not self.send_command("@XR XR_ON"):
-            return False, self.snapshot().last_error or "XR 指令发送失败。"
-        line = self.wait_for_line(
-            lambda item: item.startswith("@XR OK mode=UART") or "mode=UART" in item,
-            timeout,
-            after_id=marker,
-        )
-        if line is not None:
-            return True, "下位机已进入 XR-UART 模式。"
-        status = self.request_status(timeout=0.8)
-        if status is not None and status.mode == "UART":
-            return True, "下位机已进入 XR-UART 模式。"
-        return False, self.snapshot().last_error or "等待 XR-UART 模式切换超时。"
+        status = self.request_status(timeout=timeout)
+        if status is None:
+            return False, self.snapshot().last_error or "等待桥接握手超时。"
+        if status.bridge_ready:
+            return True, "下位机已识别，XR 桥接可用。"
+        output_name = "USB" if status.output_if == MB_OUTPUT_IF_USB else "RS232"
+        return False, f"已识别设备，但当前 LinkOut={output_name}，请切换到 RS232。"
 
     def exit_xr_mode(self, timeout: float = 3.0) -> Tuple[bool, str]:
-        marker = self.line_marker()
-        if not self.send_command("@XR XR_OFF"):
-            return False, self.snapshot().last_error or "XR 退出指令发送失败。"
-        line = self.wait_for_line(
-            lambda item: item.startswith("@XR OK mode=NODE") or "mode=NODE" in item,
-            timeout,
-            after_id=marker,
-        )
-        if line is not None:
-            return True, "下位机已退出 XR-UART 模式。"
-        status = self.request_status(timeout=0.8)
-        if status is not None and status.mode == "NODE":
-            return True, "下位机已退出 XR-UART 模式。"
-        return False, self.snapshot().last_error or "等待退出 XR-UART 模式超时。"
+        _ = timeout
+        return True, "当前桥接架构无需退出 XR 模式。"
 
     def snapshot(self) -> BridgeSnapshot:
         with self._lock:
+            status = XrDeviceStatus(**vars(self._xr_status))
+            if status.detected and self._last_status_received_at > 0:
+                status.age_ms = int(max(0.0, (time.monotonic() - self._last_status_received_at) * 1000.0))
             return BridgeSnapshot(
                 running=self._running,
                 serial_port=self._serial_port,
@@ -773,41 +1118,57 @@ class XrUartBridgeManager:
                 bridge_host=self._bridge_host,
                 bridge_port=self._bridge_port,
                 last_error=self._last_error,
-                xr_status=XrDeviceStatus(**vars(self._xr_status)),
+                xr_status=status,
                 xr_lines=list(self._xr_lines),
             )
 
-    def _record_xr_line(self, line: str) -> None:
-        status = parse_xr_status_line(line)
+    def _record_note(self, line: str) -> None:
+        text = line.strip()
+        if not text:
+            return
         with self._condition:
-            self._xr_lines.append(line)
-            self._line_event_id += 1
-            self._xr_line_events.append((self._line_event_id, line))
-            if status is not None:
-                self._xr_status = status
+            self._xr_lines.append(text)
             self._condition.notify_all()
 
-    def _consume_serial_side_channel(self, chunk: bytes) -> None:
-        for byte in chunk:
-            if not self._line_buffer:
-                if byte == ord("@"):
-                    self._line_buffer.append(byte)
-                continue
-            if byte == 13:
-                continue
-            if byte == 10:
-                line = self._line_buffer.decode("ascii", errors="ignore")
-                self._line_buffer.clear()
-                if line.startswith("@XR "):
-                    self._record_xr_line(line)
-                continue
-            if 32 <= byte <= 126:
-                if len(self._line_buffer) < 180:
-                    self._line_buffer.append(byte)
-                else:
-                    self._line_buffer.clear()
-            else:
-                self._line_buffer.clear()
+    def _record_status(self, status: XrDeviceStatus) -> None:
+        with self._condition:
+            status.age_ms = 0
+            self._xr_status = status
+            self._status_event_id += 1
+            self._status_events.append((self._status_event_id, XrDeviceStatus(**vars(status))))
+            self._last_status_received_at = time.monotonic()
+            self._need_handshake = not status.bridge_ready
+            self._xr_lines.append(
+                f"HELLO seq={status.seq} ready={int(status.bridge_ready)} "
+                f"out_if={'USB' if status.output_if == MB_OUTPUT_IF_USB else 'RS232'} "
+                f"payload={status.payload_len}"
+            )
+            self._condition.notify_all()
+
+    def _next_seq(self) -> int:
+        with self._lock:
+            seq = self._next_tx_seq
+            self._next_tx_seq = (self._next_tx_seq + 1) & 0xFFFFFFFF
+            if self._next_tx_seq == 0:
+                self._next_tx_seq = 1
+            return seq
+
+    def _send_hello_request(self) -> bool:
+        with self._lock:
+            ser = self._serial
+        if ser is None:
+            return False
+        payload = build_bridge_frame(XR_BRIDGE_HELLO_REQ, self._next_seq())
+        with self._lock:
+            self._last_handshake_sent_at = time.monotonic()
+        try:
+            ser.write(payload)
+            with self._lock:
+                self._serial_write_failures = 0
+            return True
+        except Exception as exc:
+            self._handle_serial_write_exception(exc)
+            return False
 
     def _ensure_serial(self) -> None:
         if serial is None:
@@ -823,7 +1184,7 @@ class XrUartBridgeManager:
             baud = self._serial_baud
 
         try:
-            ser = serial.Serial(port, baud, timeout=0.01, write_timeout=0.5)
+            ser = self._open_serial_port(port, baud)
         except Exception as exc:
             with self._lock:
                 self._serial_connected = False
@@ -835,48 +1196,80 @@ class XrUartBridgeManager:
             self._serial = ser
             self._serial_connected = True
             self._last_error = ""
+            self._need_handshake = True
+            self._device_buffer.clear()
+            self._packet_buffer.clear()
+            self._serial_write_failures = 0
 
     def _close_serial(self) -> None:
         with self._lock:
             ser = self._serial
             self._serial = None
             self._serial_connected = False
+            self._need_handshake = True
+            self._xr_status = XrDeviceStatus()
+            self._last_status_received_at = 0.0
+            self._serial_write_failures = 0
         if ser is not None:
+            try:
+                self._quiesce_serial_control_lines(ser)
+            except Exception:
+                pass
             try:
                 ser.close()
             except Exception:
                 pass
 
-    def _forward_packet(self, packet: bytes, seq: int) -> None:
+    def _handle_serial_write_exception(self, exc: Exception, packet: bytes = b"") -> bool:
+        should_close = True
+        failures = 0
+        transient = is_transient_serial_write_error(exc)
+        with self._lock:
+            self._last_error = str(exc)
+            if packet:
+                self._pending_packet = packet
+            if transient:
+                self._serial_write_failures += 1
+                failures = self._serial_write_failures
+                should_close = failures >= 6
+            else:
+                self._serial_write_failures = 0
+        if transient and not should_close:
+            self._record_note(f"USB write timeout x{failures}, keep bridge open and retry")
+            return False
+        self._close_serial()
+        return True
+
+    def _forward_packet(self, packet: bytes) -> None:
         with self._lock:
             ser = self._serial
-        if ser is None:
+            status = XrDeviceStatus(**vars(self._xr_status))
+        if ser is None or not status.bridge_ready:
             with self._lock:
                 self._pending_packet = packet
-                self._pending_seq = seq
             return
 
+        magic, version, _flags, inner_seq = struct.unpack_from("<IHHI", packet, 0)
+        if magic != XR_PACKET_MAGIC or version != 1:
+            self._record_note("XR 二进制包格式错误")
+            return
+
+        esp32_packet = remap_packet_world_position_for_esp32(packet)
+        payload = build_bridge_frame(XR_BRIDGE_XR_DATA, int(inner_seq), esp32_packet)
         try:
-            ser.write(packet)
-            ser.flush()
+            ser.write(payload)
             with self._lock:
                 self._pending_packet = b""
-                self._pending_seq = 0
+                self._serial_write_failures = 0
         except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-                self._pending_packet = packet
-                self._pending_seq = seq
-                self._serial_connected = False
-            self._close_serial()
+            self._handle_serial_write_exception(exc, packet)
 
     def _flush_pending_packet(self) -> None:
         with self._lock:
             packet = self._pending_packet
-            seq = self._pending_seq
-            ready = self._serial is not None
-        if ready and packet and seq:
-            self._forward_packet(packet, seq)
+            ready = self._serial is not None and self._xr_status.bridge_ready
+        if ready and packet:
+            self._forward_packet(packet)
 
     def _consume_bridge_bytes(self, chunk: bytes) -> None:
         if not chunk:
@@ -891,20 +1284,76 @@ class XrUartBridgeManager:
                     self._last_error = "XR 二进制包格式错误"
                 continue
             with self._lock:
-                self._packet_queue.append((packet, int(seq)))
+                self._packet_queue.append(packet)
+
+    def _consume_serial_bridge_frames(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        magic = struct.pack("<I", XR_BRIDGE_MAGIC)
+        self._device_buffer.extend(chunk)
+        while True:
+            index = self._device_buffer.find(magic)
+            if index < 0:
+                if len(self._device_buffer) > 3:
+                    del self._device_buffer[:-3]
+                return
+            if index > 0:
+                del self._device_buffer[:index]
+            if len(self._device_buffer) < XR_BRIDGE_HEADER_SIZE:
+                return
+
+            frame_magic, version, frame_type, payload_len, seq = struct.unpack_from(
+                "<IBBHI", self._device_buffer, 0
+            )
+            if frame_magic != XR_BRIDGE_MAGIC or version != XR_BRIDGE_VERSION or payload_len > XR_BRIDGE_MAX_PAYLOAD:
+                del self._device_buffer[0]
+                continue
+
+            frame_len = XR_BRIDGE_HEADER_SIZE + int(payload_len) + 2
+            if len(self._device_buffer) < frame_len:
+                return
+
+            frame = bytes(self._device_buffer[:frame_len])
+            recv_crc = struct.unpack_from("<H", frame, frame_len - 2)[0]
+            calc_crc = rm_crc16(frame[:-2])
+            if recv_crc != calc_crc:
+                del self._device_buffer[0]
+                continue
+
+            payload = frame[XR_BRIDGE_HEADER_SIZE:-2]
+            del self._device_buffer[:frame_len]
+            if frame_type == XR_BRIDGE_HELLO_RSP:
+                status = parse_bridge_hello_payload(payload, int(seq))
+                if status is not None:
+                    self._record_status(status)
+
+    def _poll_handshake(self) -> None:
+        with self._lock:
+            serial_ready = self._serial is not None
+            status = XrDeviceStatus(**vars(self._xr_status))
+            last_sent_at = self._last_handshake_sent_at
+            last_recv_at = self._last_status_received_at
+            need = self._need_handshake or not status.detected or not status.bridge_ready
+        if not serial_ready:
+            return
+        now = time.monotonic()
+        if not need and (now - last_recv_at) < 2.0:
+            return
+        if (now - last_sent_at) < 0.5:
+            return
+        self._send_hello_request()
 
     def _tx_loop(self) -> None:
         target_interval = 1.0 / 60.0
         while not self._stop_event.is_set():
             start_time = time.perf_counter()
-            packet = None
-            seq = 0
+            packet: Optional[bytes] = None
             with self._lock:
                 if self._packet_queue:
-                    packet, seq = self._packet_queue[-1]
+                    packet = self._packet_queue[-1]
                     self._packet_queue.clear()
             if packet is not None:
-                self._forward_packet(packet, seq)
+                self._forward_packet(packet)
             elapsed = time.perf_counter() - start_time
             remaining = target_interval - elapsed
             if remaining > 0:
@@ -927,6 +1376,7 @@ class XrUartBridgeManager:
 
             while not self._stop_event.is_set():
                 self._ensure_serial()
+                self._poll_handshake()
                 self._flush_pending_packet()
 
                 if client_socket is None:
@@ -972,7 +1422,7 @@ class XrUartBridgeManager:
                     try:
                         chunk = ser.read(ser.in_waiting or 1)
                         if chunk:
-                            self._consume_serial_side_channel(chunk)
+                            self._consume_serial_bridge_frames(chunk)
                     except Exception as exc:
                         with self._lock:
                             self._last_error = str(exc)
@@ -1184,6 +1634,16 @@ class GnirehtetManager:
             return True, self._gnirehtet_path
         return False, "未找到 gnirehtet。Windows 下请检查 webxr/platform-tools，Arch Linux 下请安装 gnirehtet 并加入 PATH。"
 
+    def _run_adb_for_device(self, adb_args: Sequence[str], *, timeout: float = 20.0) -> Tuple[bool, str]:
+        ok, adb_or_message = self._ensure_adb()
+        if not ok:
+            return False, adb_or_message
+        with self._lock:
+            device = self._device
+        if device is None:
+            return False, "当前没有可用的 Quest/Android 设备。"
+        return run_command((adb_or_message, "-s", device.serial, *adb_args), cwd=WEBXR_DIR, timeout=timeout)
+
     def is_running(self) -> bool:
         with self._lock:
             return self._process is not None and self._process.poll() is None
@@ -1268,6 +1728,39 @@ class GnirehtetManager:
             return False, self.status().last_error or "gnirehtet 启动失败。"
         return True, f"gnirehtet 已启动: {device.serial}"
 
+    def force_stop_browser(self) -> Tuple[bool, str]:
+        # ok, message = self._run_adb_for_device(("shell", "am", "force-stop", "com.oculus.browser"))
+        # if ok:
+        #     return True, "已执行 adb force-stop com.oculus.browser，Quest 浏览器 WebXR 环境已清理。"
+        #
+        # fallback_ok, _fallback_message = self._run_adb_for_device(("shell", "am", "force-stop", "com.meta.browser"))
+        # if fallback_ok:
+        #     return True, "已执行浏览器 force-stop（兼容包名 com.meta.browser）。"
+        # return False, message
+        return True, "已跳过 adb 关闭 Quest 浏览器指令。"
+
+    def open_webxr_url(self, url: str) -> Tuple[bool, str]:
+        if not url:
+            return False, "没有可用于 Quest 的 WebXR 访问地址。"
+        # ok, message = self._run_adb_for_device(
+        #     (
+        #         "shell",
+        #         "am",
+        #         "start",
+        #         "-a",
+        #         "android.intent.action.VIEW",
+        #         "-n",
+        #         "com.oculus.vrshell/.MainActivity",
+        #         "-d",
+        #         url,
+        #     ),
+        #     timeout=25.0,
+        # )
+        # if ok:
+        #     return True, f"Quest 已尝试打开: {url}"
+        # return False, message
+        return True, f"已跳过 adb 启动 Quest 浏览器指令: {url}"
+
     def stop(self) -> None:
         with self._lock:
             process = self._process
@@ -1335,11 +1828,25 @@ SUBTITLE_TEXT = "适用于CCtrl的WebXR桥接工具"
 TITLE_GRADIENT = ("#7dd3fc", "#38bdf8", "#22c55e", "#f59e0b", "#f472b6")
 
 
+def format_output_interface(output_if: int) -> str:
+    return "USB" if int(output_if) == MB_OUTPUT_IF_USB else "RS232"
+
+
 def format_xr_status(status: XrDeviceStatus) -> str:
+    if not status.detected:
+        return "等待 HELLO 握手"
+    caps: List[str] = []
+    if status.caps & XR_BRIDGE_CAP_PAYLOAD_96:
+        caps.append("96B")
+    if status.caps & XR_BRIDGE_CAP_DELTA_ARBITER:
+        caps.append("ARB")
+    if status.caps & XR_BRIDGE_CAP_CRC16:
+        caps.append("CRC16")
+    ready_text = "就绪" if status.bridge_ready else "待切 RS232"
+    caps_text = "/".join(caps) if caps else "--"
     return (
-        f"XR mode={status.mode} requested={int(status.requested)} "
-        f"link={int(status.link_active)} pose={int(status.has_pose)} "
-        f"restore={int(status.restore_pending)} seq={status.seq} age={status.age_ms} ms"
+        f"{ready_text} out={format_output_interface(status.output_if)} "
+        f"seq={status.seq} age={status.age_ms}ms caps={caps_text}"
     )
 
 
@@ -1436,37 +1943,7 @@ def build_runtime_panel(step_statuses: Sequence[Tuple[str, str]], current_step: 
 if UI_IMPORT_ERROR is None:
 
     class ChoiceScreen(ModalScreen[Optional[str]]):
-        CSS = """
-        ChoiceScreen {
-            align: center middle;
-            background: rgba(2, 6, 23, 0.82);
-        }
-        #choice_dialog {
-            width: 88;
-            height: auto;
-            max-height: 32;
-            background: #0f172a;
-            border: thick #38bdf8;
-            padding: 1 2;
-        }
-        #choice_title {
-            color: #f8fafc;
-            text-style: bold;
-            margin-bottom: 1;
-        }
-        #choice_desc {
-            color: #94a3b8;
-            margin-bottom: 1;
-        }
-        #choice_buttons {
-            margin-top: 1;
-            height: auto;
-        }
-        #choice_buttons Button {
-            width: 1fr;
-            margin-right: 1;
-        }
-        """
+        CSS = ""
 
         BINDINGS = [Binding("escape", "cancel", "取消")]
 
@@ -1522,35 +1999,7 @@ if UI_IMPORT_ERROR is None:
 
 
     class ConfirmScreen(ModalScreen[bool]):
-        CSS = """
-        ConfirmScreen {
-            align: center middle;
-            background: rgba(2, 6, 23, 0.78);
-        }
-        #confirm_dialog {
-            width: 82;
-            height: auto;
-            background: #0f172a;
-            border: thick #22c55e;
-            padding: 1 2;
-        }
-        #confirm_title {
-            color: #f8fafc;
-            text-style: bold;
-            margin-bottom: 1;
-        }
-        #confirm_message {
-            color: #cbd5e1;
-            margin-bottom: 1;
-        }
-        #confirm_buttons {
-            height: auto;
-        }
-        #confirm_buttons Button {
-            width: 1fr;
-            margin-right: 1;
-        }
-        """
+        CSS = ""
 
         BINDINGS = [Binding("escape", "cancel", "取消")]
 
@@ -1584,68 +2033,7 @@ if UI_IMPORT_ERROR is None:
 
 
     class CCBridgeTui(App[None]):
-        CSS = """
-        Screen {
-            background: #060816;
-            color: #e2e8f0;
-        }
-        #root {
-            layout: vertical;
-            height: 1fr;
-        }
-        #hero {
-            height: 12;
-            margin: 0 1 0 1;
-        }
-        #main {
-            layout: horizontal;
-            height: 1fr;
-            margin: 0 1 1 1;
-        }
-        #status_title, #log_title, #action_title {
-            color: #f8fafc;
-            text-style: bold;
-            margin-bottom: 0;
-        }
-        #status_column {
-            width: 5fr;
-            padding-right: 0;
-        }
-        #log_column {
-            width: 4fr;
-            padding: 0 0 0 1;
-        }
-        #action_column {
-            width: 3fr;
-            padding-left: 0;
-        }
-        .status_card {
-            height: auto;
-            margin-bottom: 0;
-        }
-        #event_log {
-            border: round #334155;
-            background: #0b1120;
-            color: #dbeafe;
-            height: 1fr;
-        }
-        #busy_indicator {
-            height: 2;
-            margin-bottom: 0;
-        }
-        #step_status {
-            margin-bottom: 0;
-        }
-        #action_column Button {
-            width: 100%;
-            height: 3;
-            min-height: 3;
-            margin-bottom: 0;
-        }
-        Footer {
-            background: #0f172a;
-        }
-        """
+        CSS = ""
 
         BINDINGS = [
             Binding("q", "request_quit", "退出"),
@@ -1683,6 +2071,8 @@ if UI_IMPORT_ERROR is None:
                 ]
             )
             self._current_step = "等待初始化"
+            self._last_quest_launch_url = ""
+            self._last_quest_launch_at = 0.0
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
@@ -1703,6 +2093,7 @@ if UI_IMPORT_ERROR is None:
                         yield Label("初始化与控制", id="action_title")
                         yield LoadingIndicator(id="busy_indicator")
                         yield Static(id="step_status")
+                        yield Button("校准XR坐标系: 关", id="action_calibration")
                         yield Button("重新选择USB串口", id="action_serial", variant="primary")
                         yield Button("重新连接gnirehtet", id="action_gnirehtet")
                         yield Button("重启WebXR服务", id="action_web")
@@ -1714,6 +2105,7 @@ if UI_IMPORT_ERROR is None:
         async def on_mount(self) -> None:
             self._busy_indicator = self.query_one("#busy_indicator", LoadingIndicator)
             self._busy_indicator.display = False
+            self._sync_calibration_button()
             await self._refresh_dashboard(force_status_poll=False)
             self._refresh_task = asyncio.create_task(self._refresh_loop())
             self.run_worker(self._run_initial_sequence(), exclusive=True, group="ccbridge-init")
@@ -1733,6 +2125,7 @@ if UI_IMPORT_ERROR is None:
 
         def _set_buttons_disabled(self, disabled: bool) -> None:
             for button_id in (
+                "action_calibration",
                 "action_serial",
                 "action_gnirehtet",
                 "action_web",
@@ -1773,6 +2166,12 @@ if UI_IMPORT_ERROR is None:
                 build_runtime_panel(self._step_statuses, self._current_step, self._busy)
             )
 
+        def _sync_calibration_button(self) -> None:
+            enabled = bool(load_runtime_config().get("calibrationModeEnabled", False))
+            button = self.query_one("#action_calibration", Button)
+            button.label = "校准XR坐标系: 开" if enabled else "校准XR坐标系: 关"
+            button.variant = "primary" if enabled else "default"
+
         async def _run_blocking(self, step: str, func, *args):
             self._set_busy(True, step)
             try:
@@ -1787,6 +2186,31 @@ if UI_IMPORT_ERROR is None:
                 web=self._web_service.fetch_status(),
                 cert=collect_cert_status(),
             )
+
+        def _open_quest_webxr_sync(self) -> Tuple[bool, str]:
+            web_status = self._web_service.fetch_status()
+            if not web_status.running:
+                return False, "WebXR 服务尚未运行，无法自动打开 Quest 页面。"
+            url = pick_remote_access_url(web_status.access_urls)
+            if not url:
+                return False, "未找到可供 Quest 使用的非回环访问地址。"
+            now = time.monotonic()
+            if self._last_quest_launch_url == url and now - self._last_quest_launch_at < 2.0:
+                return True, f"已跳过重复打开: {url}"
+            ok, message = self._gnirehtet.open_webxr_url(url)
+            if ok:
+                self._last_quest_launch_url = url
+                self._last_quest_launch_at = now
+            return ok, message
+
+        async def _maybe_open_quest_webxr(self, step_label: str) -> None:
+            cert_status = collect_cert_status()
+            if not cert_status.https_ready:
+                self._write_log("HTTPS 证书尚未就绪，暂不自动打开 Quest WebXR 页面。", style="#fbbf24")
+                return
+            ok, message = await self._run_blocking("让 Quest 打开 WebXR 页面", self._open_quest_webxr_sync)
+            self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase(step_label, message, color="#22c55e" if ok else "#ef4444")
 
         async def _refresh_dashboard(self, *, force_status_poll: bool) -> None:
             if self._refreshing:
@@ -1813,7 +2237,7 @@ if UI_IMPORT_ERROR is None:
             ]
             if bridge.last_error:
                 bridge_rows.append(("错误", bridge.last_error))
-            self.query_one("#usb_card", Static).update(build_info_panel("USB / XR-UART", bridge_rows, "#38bdf8"))
+            self.query_one("#usb_card", Static).update(build_info_panel("USB / XR桥接", bridge_rows, "#38bdf8"))
 
             gn = bundle.gnirehtet
             gn_rows = [
@@ -1825,10 +2249,12 @@ if UI_IMPORT_ERROR is None:
             self.query_one("#gnirehtet_card", Static).update(build_info_panel("gnirehtet", gn_rows, "#22c55e"))
 
             web = bundle.web
+            runtime_config = load_runtime_config()
             web_rows = [
                 ("状态", "运行中" if web.running else "未运行"),
                 ("客户端", f"{web.clients} clients / {web.active_sessions} sessions"),
                 ("桥接", f"{web.bridge_host}:{web.bridge_port} {'OK' if web.bridge_connected else 'WAIT'}"),
+                ("校准模式", "开启" if bool(runtime_config.get("calibrationModeEnabled", False)) else "关闭"),
             ]
             if web.last_error:
                 web_rows.append(("错误", web.last_error))
@@ -1844,6 +2270,7 @@ if UI_IMPORT_ERROR is None:
                 cert_rows.append(("缺失项", ", ".join(relpath(path) for path in cert.missing_paths)))
             self.query_one("#cert_card", Static).update(build_info_panel("证书", cert_rows, "#f59e0b"))
             self.query_one("#url_card", Static).update(build_url_panel(web.access_urls))
+            self._sync_calibration_button()
             self._update_runtime_panel()
 
         async def _run_initial_sequence(self) -> None:
@@ -1907,14 +2334,19 @@ if UI_IMPORT_ERROR is None:
                 return False, [snapshot.last_error or "端口未就绪"]
             lines.append(f"串口已连接: {port.device} @ {self._baud}")
             status = self._bridge.request_status(timeout=1.0)
-            if status is not None:
-                lines.append(format_xr_status(status))
-            ok, message = self._bridge.enter_xr_mode(timeout=2.0)
-            lines.append(message)
-            status = self._bridge.request_status(timeout=1.0)
-            if ok and status is not None:
-                lines.append(format_xr_status(status))
-            return ok, lines
+            if status is None:
+                snapshot = self._bridge.snapshot()
+                self._bridge.stop()
+                return False, lines + [snapshot.last_error or "未收到设备 HELLO 应答"]
+            lines.append(format_xr_status(status))
+            if status.bridge_ready:
+                lines.append("下位机已识别，XR 桥接可立即使用。")
+            else:
+                lines.append(
+                    f"下位机已识别，但当前 LinkOut={format_output_interface(status.output_if)}。"
+                )
+                lines.append("切到 RS232 后会自动热恢复，无需重新连接。")
+            return True, lines
 
         async def _usb_step(self, *, step_label: str) -> None:
             self._update_step_state(step_label, "working")
@@ -1932,7 +2364,7 @@ if UI_IMPORT_ERROR is None:
                 for line in lines:
                     self._write_log(line, style="#cbd5e1" if ok else "#fca5a5")
                 if ok:
-                    self._log_phase(step_label, f"{port.device} 已就绪并进入 XR-UART", color="#22c55e")
+                    self._log_phase(step_label, f"{port.device} 串口桥已连接", color="#22c55e")
                     self._update_step_state(step_label, "done")
                     await self._refresh_dashboard(force_status_poll=False)
                     return
@@ -1989,6 +2421,17 @@ if UI_IMPORT_ERROR is None:
             ok, message = await self._run_blocking(step_label, self._gnirehtet.start, device)
             self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
             self._log_phase(step_label, message, color="#22c55e" if ok else "#ef4444")
+            if ok:
+                stop_ok, stop_message = await self._run_blocking(
+                    "清理 Quest 浏览器 WebXR 环境",
+                    self._gnirehtet.force_stop_browser,
+                )
+                self._write_log(stop_message, style="#cbd5e1" if stop_ok else "#fca5a5")
+                self._log_phase(
+                    "Quest 浏览器清理",
+                    stop_message,
+                    color="#22c55e" if stop_ok else "#ef4444",
+                )
             self._update_step_state(step_label, "done" if ok else "error")
             await self._refresh_dashboard(force_status_poll=False)
 
@@ -2004,6 +2447,8 @@ if UI_IMPORT_ERROR is None:
             self._log_phase(step_label, message, color="#22c55e" if ok else "#ef4444")
             self._update_step_state(step_label, "done" if ok else "error")
             await self._refresh_dashboard(force_status_poll=False)
+            if ok:
+                await self._maybe_open_quest_webxr("Quest 自动打开")
 
         def _generate_certs_and_restart_sync(self) -> Tuple[bool, List[str]]:
             lines: List[str] = []
@@ -2046,22 +2491,47 @@ if UI_IMPORT_ERROR is None:
             self._log_phase(step_label, "证书生成流程完成" if ok else "证书生成失败", color="#22c55e" if ok else "#ef4444")
             self._update_step_state(step_label, "done" if ok else "error")
             await self._refresh_dashboard(force_status_poll=False)
+            if ok:
+                await self._maybe_open_quest_webxr("Quest 自动打开")
 
         async def _reselect_serial_action(self) -> None:
             if self._bridge.is_running():
-                await self._run_blocking("退出当前 XR-UART 连接", self._bridge.exit_xr_mode, 1.5)
                 await self._run_blocking("关闭当前串口桥", self._bridge.stop)
             await self._usb_step(step_label="USB串口连接")
 
         async def _reconnect_gnirehtet_action(self) -> None:
             await self._run_blocking("停止当前 gnirehtet", self._gnirehtet.stop)
             await self._gnirehtet_step(step_label="gnirehtet连接")
+            if self._web_service.is_running():
+                await self._maybe_open_quest_webxr("Quest 自动打开")
 
         async def _restart_web_action(self) -> None:
             await self._run_blocking("停止 WebXR 服务", self._web_service.stop_service)
             ok, message = await self._run_blocking("重启 WebXR 服务", self._web_service.start_service, False)
             self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
             self._log_phase("WebXR服务重启", message, color="#22c55e" if ok else "#ef4444")
+            await self._refresh_dashboard(force_status_poll=False)
+            if ok:
+                await self._maybe_open_quest_webxr("Quest 自动打开")
+
+        def _set_calibration_mode_sync(self, enabled: bool) -> Tuple[bool, str]:
+            try:
+                config = load_runtime_config()
+                config["calibrationModeEnabled"] = bool(enabled)
+                save_runtime_config(config)
+                return True, f"XR 坐标系校准模式已{'开启' if enabled else '关闭'}。"
+            except Exception as exc:
+                return False, f"写入运行配置失败: {exc}"
+
+        async def _toggle_calibration_action(self) -> None:
+            current = bool(load_runtime_config().get("calibrationModeEnabled", False))
+            ok, message = await self._run_blocking(
+                "切换 XR 坐标系校准模式",
+                self._set_calibration_mode_sync,
+                not current,
+            )
+            self._write_log(message, style="#cbd5e1" if ok else "#fca5a5")
+            self._log_phase("校准XR坐标系", message, color="#22c55e" if ok else "#ef4444")
             await self._refresh_dashboard(force_status_poll=False)
 
         async def _regenerate_certs_action(self) -> None:
@@ -2083,7 +2553,9 @@ if UI_IMPORT_ERROR is None:
             if self._busy:
                 return
             button_id = event.button.id
-            if button_id == "action_serial":
+            if button_id == "action_calibration":
+                self.run_worker(self._toggle_calibration_action(), exclusive=True, group="ccbridge-action")
+            elif button_id == "action_serial":
                 self.run_worker(self._reselect_serial_action(), exclusive=True, group="ccbridge-action")
             elif button_id == "action_gnirehtet":
                 self.run_worker(self._reconnect_gnirehtet_action(), exclusive=True, group="ccbridge-action")
@@ -2113,7 +2585,6 @@ if UI_IMPORT_ERROR is None:
             self._shutdown_started = True
             self._web_service.stop_service()
             if self._bridge.is_running():
-                self._bridge.exit_xr_mode(timeout=2.5)
                 self._bridge.stop()
             self._gnirehtet.stop()
 
@@ -2127,6 +2598,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="USB 串口波特率，默认 2000000")
     parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT, help="WebXR 服务端口，默认 8787")
     parser.add_argument("--skip-cleanup", action="store_true", help="跳过启动前残留进程清理")
+    parser.add_argument(
+        "--ui-scale",
+        type=float,
+        default=None,
+        help="TUI 缩放倍率，范围约 0.65~1.35；小终端可试 0.85",
+    )
+    parser.add_argument(
+        "--ui-density",
+        choices=TUI_DENSITY_VALUES,
+        default=None,
+        help="TUI 布局密度：compact / normal / comfortable",
+    )
     return parser
 
 
@@ -2141,6 +2624,11 @@ def main() -> int:
 
     parser = build_parser()
     args = parser.parse_args()
+    if UI_IMPORT_ERROR is None:
+        layout = resolve_tui_layout(args)
+        ChoiceScreen.CSS = build_choice_screen_css(layout)
+        ConfirmScreen.CSS = build_confirm_screen_css(layout)
+        CCBridgeTui.CSS = build_app_css(layout)
     app = CCBridgeTui(args)
     try:
         app.run()

@@ -452,7 +452,8 @@ function defaultRuntimeConfig() {
     bridgeHost: '127.0.0.1',
     bridgePort: 8791,
     positionScale: 1.0,
-    rotationScale: 1.0
+    rotationScale: 1.0,
+    calibrationModeEnabled: false
   };
 }
 

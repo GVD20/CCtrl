@@ -12,6 +12,7 @@ type ControllerFrameSample = {
   connected: boolean;
   position: THREE.Vector3;
   quaternion: THREE.Quaternion;
+  rawQuaternion: THREE.Quaternion;
   axes: number[];
   buttonsRaw: number[];
   triggerValue: number;
@@ -87,6 +88,9 @@ type PoseFrameMessage = {
 type ControllerVisual = {
   root: THREE.Group;
   header: THREE.Sprite;
+  directionArrowMaterial: THREE.MeshStandardMaterial;
+  directionArrowIdleColor: THREE.Color;
+  directionArrowPressedColor: THREE.Color;
 };
 
 type HandGestureFingerName = 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
@@ -109,6 +113,8 @@ type HandFrameSample = {
   fingertips: Record<HandGestureFingerName, THREE.Vector3>;
   palmUp: boolean;
   openHand: boolean;
+  stayEligible: boolean;
+  touchIndex: boolean;
   touchMiddle: boolean;
   touchRing: boolean;
 };
@@ -150,6 +156,7 @@ type WorldPanel = {
 type RuntimeConfigView = {
   positionScale: number;
   rotationScale: number;
+  calibrationModeEnabled: boolean;
   lastFetchedAtMs: number;
 };
 
@@ -224,18 +231,23 @@ const KEY_PANEL_BITS = [0x01, 0x02, 0x04, 0x08] as const;
 const DELTA_KEY_BIT = 0x10;
 const KEY6_BIT = 0x20;
 const KEY7_BIT = 0x40;
+const TRIGGER_PRESS_THRESHOLD = 0.72;
 const PANEL_HOLD_MS = 450;
 const AXIS_FADE_MS = 5000;
 const CONTROLLER_POSE_HOLD_MS = 140;
+const AUTO_ENTER_XR_ON_LOAD = true;
 const ENABLE_HAND_GESTURE_KEYS = true;
 const HAND_GESTURE_ENTER_HOLD_MS = 300;
 const HAND_GESTURE_EXIT_HOLD_MS = 260;
-const HAND_GESTURE_REFRACTORY_MS = 1000;
 const HAND_GESTURE_TOUCH_DISTANCE_M = 0.035;
 const HAND_GESTURE_PALM_UP_DOT = 0.55;
+const HAND_GESTURE_STAY_PALM_UP_DOT = 0.32;
 const HAND_GESTURE_FINGER_EXTEND_MARGIN_M = 0.03;
+const HAND_GESTURE_STAY_FINGER_EXTEND_MARGIN_M = 0.016;
 const HAND_GESTURE_MIN_SPACING_M = 0.024;
+const HAND_GESTURE_STAY_MIN_SPACING_M = 0.012;
 const HAND_GESTURE_THUMB_INDEX_SPACING_M = 0.04;
+const HAND_GESTURE_STAY_THUMB_INDEX_SPACING_M = 0.022;
 const HAND_GESTURE_STILL_DELTA_M = 0.006;
 const HAND_GESTURE_ACTIVE_MARKER_SCALE = 1.45;
 const HAND_GESTURE_IDLE_MARKER_SCALE = 1;
@@ -294,12 +306,32 @@ const scratchQuatB = new THREE.Quaternion();
 const scratchQuatC = new THREE.Quaternion();
 const scratchHead = new THREE.Vector3();
 const raycaster = new THREE.Raycaster();
+const worldUp = new THREE.Vector3(0, 1, 0);
+// World/position contract redefined on top of native WebXR space:
+//   +X = native +X
+//   +Y = native +Z  (mirrored from the old forward direction)
+//   +Z = native +Y
+// This matches the ESP32 ABS/world frame as a left-handed Z-up system.
+const txWorldAxisX = new THREE.Vector3(1, 0, 0);
+const txWorldAxisY = new THREE.Vector3(0, 0, 1);
+const txWorldAxisZ = new THREE.Vector3(0, 1, 0);
+// Handle/local attitude contract stays on the agreed IMU-like axis definition:
+//   +X = native +X
+//   +Y = native -Z
+//   +Z = native +Y
+const txLocalAxisX = new THREE.Vector3(1, 0, 0);
+const txLocalAxisY = new THREE.Vector3(0, 0, -1);
+const txLocalAxisZ = new THREE.Vector3(0, 1, 0);
+// Apply a fixed local roll for the hand/controller local frame only. World
+// frame calibration must keep using the raw WebXR grip quaternion.
+const controllerGripPoseOffset = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
 
 const currentSessionMode = { value: 'desktop' as SessionMode };
 const xrSupport = { ar: false, vr: false };
 const runtimeConfigView: RuntimeConfigView = {
   positionScale: 1,
   rotationScale: 1,
+  calibrationModeEnabled: false,
   lastFetchedAtMs: 0
 };
 
@@ -308,6 +340,7 @@ let referenceSpaceRequest: Promise<XRReferenceSpace> | null = null;
 let xrSessionId: string | null = null;
 let xrFrameSeq = 0;
 let pendingSessionMode: Exclude<SessionMode, 'desktop'> | null = null;
+let xrAutoEnterAttempted = false;
 
 const controlFrame = {
   initialized: false,
@@ -316,6 +349,7 @@ const controlFrame = {
   adjustStartPosition: new THREE.Vector3(),
   adjustStartQuaternion: new THREE.Quaternion(),
   hasAdjustReference: false,
+  adjustSource: null as 'right-controller' | 'left-hand' | null,
   fadeAlpha: 0,
   lastReleaseMs: 0,
   active: false
@@ -480,11 +514,40 @@ async function setupXrButton() {
     xrStatusEl.textContent = arSupported ? '混合现实已就绪' : vrSupported ? '仅支持沉浸式 VR' : '无沉浸式支持';
     xrButtonEl.textContent = arSupported ? '进入 XR' : vrSupported ? '进入 VR' : 'XR 不可用';
     xrButtonEl.disabled = !(arSupported || vrSupported);
+    scheduleAutoEnterXr();
   } catch {
     xrStatusEl.textContent = 'XR 能力检测失败';
     xrButtonEl.textContent = 'XR 不可用';
     xrButtonEl.disabled = true;
   }
+}
+
+function scheduleAutoEnterXr() {
+  if (!AUTO_ENTER_XR_ON_LOAD || xrAutoEnterAttempted || renderer.xr.isPresenting || !(xrSupport.ar || xrSupport.vr)) {
+    return;
+  }
+
+  const attempt = () => {
+    if (xrAutoEnterAttempted || renderer.xr.isPresenting) {
+      return;
+    }
+    xrAutoEnterAttempted = true;
+    void toggleXrSession();
+  };
+
+  if (document.visibilityState === 'visible') {
+    window.setTimeout(attempt, 80);
+    return;
+  }
+
+  const onVisible = () => {
+    if (document.visibilityState !== 'visible') {
+      return;
+    }
+    document.removeEventListener('visibilitychange', onVisible);
+    window.setTimeout(attempt, 80);
+  };
+  document.addEventListener('visibilitychange', onVisible);
 }
 
 async function toggleXrSession() {
@@ -567,15 +630,18 @@ function updateXrFrame(frame: XRFrame) {
     left: null,
     right: null
   } as Record<Handedness, ControllerFrameSample | null>;
-  let rightHandSample: HandFrameSample | null = null;
+  const handSamples = {
+    left: null,
+    right: null
+  } as Record<Handedness, HandFrameSample | null>;
 
   for (const inputSource of session.inputSources) {
     if (inputSource.handedness !== 'left' && inputSource.handedness !== 'right') {
       continue;
     }
 
-    if (ENABLE_HAND_GESTURE_KEYS && inputSource.handedness === 'right') {
-      rightHandSample = createHandFrameSample(frame, inputSource, activeReferenceSpace);
+    if (ENABLE_HAND_GESTURE_KEYS) {
+      handSamples[inputSource.handedness] = createHandFrameSample(frame, inputSource, activeReferenceSpace);
     }
 
     const space = inputSource.gripSpace ?? inputSource.targetRaySpace;
@@ -587,10 +653,10 @@ function updateXrFrame(frame: XRFrame) {
     samples[inputSource.handedness] = createFrameSample(pose, inputSource.gamepad ?? null);
   }
 
-  updateControlFrameFromInput(samples.right);
+  updateControlFrameFromInput(samples.right, samples.left, handSamples.left);
   applyControllerSamples(samples, frame.predictedDisplayTime);
   handlePanelInput(samples.right);
-  updateHandGestureState(rightHandSample, nowMs);
+  updateHandGestureState(handSamples.right, nowMs);
   panelInteraction.keyFlags |= handGestureState.keyFlags;
   drawPanels();
   updateControlFrameVisual(nowMs);
@@ -620,12 +686,15 @@ function updateXrFrame(frame: XRFrame) {
 function createFrameSample(pose: XRPose, gamepad: Gamepad | null): ControllerFrameSample {
   tempMatrix.fromArray(pose.transform.matrix);
   tempMatrix.decompose(tempPosition, tempQuaternion, tempScale);
+  const rawQuaternion = tempQuaternion.clone();
+  tempQuaternion.multiply(controllerGripPoseOffset).normalize();
 
   const axes = gamepad ? [...gamepad.axes] : [];
   return {
     connected: true,
     position: tempPosition.clone(),
     quaternion: tempQuaternion.clone(),
+    rawQuaternion,
     axes,
     buttonsRaw: gamepad ? gamepad.buttons.map((button) => round3(button.value)) : [],
     triggerValue: gamepad ? round3(gamepad.buttons[0]?.value ?? 0) : 0,
@@ -670,18 +739,30 @@ function createHandFrameSample(frame: XRFrame, inputSource: XRInputSource, refer
   const fingerForward = scratchVecB.copy(middleTip).sub(wrist);
   const palmNormal = scratchVecC.copy(palmAcross).cross(fingerForward).normalize();
   const palmUp = palmNormal.dot(new THREE.Vector3(0, 1, 0)) >= HAND_GESTURE_PALM_UP_DOT;
+  const stayPalmUp = palmNormal.dot(new THREE.Vector3(0, 1, 0)) >= HAND_GESTURE_STAY_PALM_UP_DOT;
 
   const thumbExtended = isFingerExtended(wrist, thumbTip, indexMetacarpal);
+  const thumbStayExtended = isFingerExtended(wrist, thumbTip, indexMetacarpal, HAND_GESTURE_STAY_FINGER_EXTEND_MARGIN_M);
   const indexExtended = isFingerExtended(wrist, indexTip, indexMetacarpal);
+  const indexStayExtended = isFingerExtended(wrist, indexTip, indexMetacarpal, HAND_GESTURE_STAY_FINGER_EXTEND_MARGIN_M);
   const middleExtended = isFingerExtended(wrist, middleTip, middleProximal);
+  const middleStayExtended = isFingerExtended(wrist, middleTip, middleProximal, HAND_GESTURE_STAY_FINGER_EXTEND_MARGIN_M);
   const ringExtended = isFingerExtended(wrist, ringTip, ringProximal);
+  const ringStayExtended = isFingerExtended(wrist, ringTip, ringProximal, HAND_GESTURE_STAY_FINGER_EXTEND_MARGIN_M);
   const pinkyExtended = isFingerExtended(wrist, pinkyTip, pinkyProximal);
+  const pinkyStayExtended = isFingerExtended(wrist, pinkyTip, pinkyProximal, HAND_GESTURE_STAY_FINGER_EXTEND_MARGIN_M);
   const spacingOpen =
     thumbTip.distanceTo(indexTip) >= HAND_GESTURE_THUMB_INDEX_SPACING_M &&
     indexTip.distanceTo(middleTip) >= HAND_GESTURE_MIN_SPACING_M &&
     middleTip.distanceTo(ringTip) >= HAND_GESTURE_MIN_SPACING_M &&
     ringTip.distanceTo(pinkyTip) >= HAND_GESTURE_MIN_SPACING_M;
+  const spacingStayOpen =
+    thumbTip.distanceTo(indexTip) >= HAND_GESTURE_STAY_THUMB_INDEX_SPACING_M &&
+    indexTip.distanceTo(middleTip) >= HAND_GESTURE_STAY_MIN_SPACING_M &&
+    middleTip.distanceTo(ringTip) >= HAND_GESTURE_STAY_MIN_SPACING_M &&
+    ringTip.distanceTo(pinkyTip) >= HAND_GESTURE_STAY_MIN_SPACING_M;
   const openHand = thumbExtended && indexExtended && middleExtended && ringExtended && pinkyExtended && spacingOpen;
+  const stayEligible = stayPalmUp && thumbStayExtended && indexStayExtended && middleStayExtended && ringStayExtended && pinkyStayExtended && spacingStayOpen;
 
   return {
     connected: true,
@@ -689,6 +770,8 @@ function createHandFrameSample(frame: XRFrame, inputSource: XRInputSource, refer
     fingertips,
     palmUp,
     openHand,
+    stayEligible,
+    touchIndex: thumbTip.distanceTo(indexTip) <= HAND_GESTURE_TOUCH_DISTANCE_M,
     touchMiddle: thumbTip.distanceTo(middleTip) <= HAND_GESTURE_TOUCH_DISTANCE_M,
     touchRing: thumbTip.distanceTo(ringTip) <= HAND_GESTURE_TOUCH_DISTANCE_M
   };
@@ -749,10 +832,6 @@ function updateHandGestureState(sample: HandFrameSample | null, nowMs: number) {
     handGestureState.touchMiddle = false;
     handGestureState.touchRing = false;
     handGestureState.keyFlags = 0;
-    handGestureState.cooldownUntilMs = 0;
-    handGestureState.cooldownActive = false;
-    handGestureState.previousRawTouchMiddle = false;
-    handGestureState.previousRawTouchRing = false;
     handGestureState.hasPreviousPose = false;
     updateHandGestureVisual(null);
     return;
@@ -763,7 +842,7 @@ function updateHandGestureState(sample: HandFrameSample | null, nowMs: number) {
   handGestureState.openHand = sample.openHand;
   handGestureState.still = isHandPoseStill(sample);
   const entryEligible = sample.palmUp && sample.openHand && handGestureState.still;
-  const stayEligible = sample.palmUp && sample.openHand;
+  const stayEligible = sample.stayEligible;
   handGestureState.eligible = handGestureState.active ? stayEligible : entryEligible;
   rememberHandPose(sample);
 
@@ -785,17 +864,8 @@ function updateHandGestureState(sample: HandFrameSample | null, nowMs: number) {
     }
   }
 
-  const rawTouchMiddle = handGestureState.active && sample.touchMiddle;
-  const rawTouchRing = handGestureState.active && sample.touchRing;
-  handGestureState.cooldownActive = nowMs < handGestureState.cooldownUntilMs;
-  const triggerMiddle = rawTouchMiddle && !handGestureState.previousRawTouchMiddle && !handGestureState.cooldownActive;
-  const triggerRing = rawTouchRing && !handGestureState.previousRawTouchRing && !handGestureState.cooldownActive;
-  if (triggerMiddle || triggerRing) {
-    handGestureState.cooldownUntilMs = nowMs + HAND_GESTURE_REFRACTORY_MS;
-    handGestureState.cooldownActive = true;
-  }
-  handGestureState.touchMiddle = triggerMiddle;
-  handGestureState.touchRing = triggerRing;
+  handGestureState.touchMiddle = handGestureState.active && sample.touchMiddle;
+  handGestureState.touchRing = handGestureState.active && sample.touchRing;
   handGestureState.keyFlags = 0;
   if (handGestureState.touchMiddle) {
     handGestureState.keyFlags |= KEY6_BIT;
@@ -803,8 +873,6 @@ function updateHandGestureState(sample: HandFrameSample | null, nowMs: number) {
   if (handGestureState.touchRing) {
     handGestureState.keyFlags |= KEY7_BIT;
   }
-  handGestureState.previousRawTouchMiddle = rawTouchMiddle;
-  handGestureState.previousRawTouchRing = rawTouchRing;
 
   updateHandGestureVisual(handGestureState.active ? sample : null);
   if (handGestureState.active) {
@@ -813,35 +881,50 @@ function updateHandGestureState(sample: HandFrameSample | null, nowMs: number) {
   }
 }
 
-function updateControlFrameFromInput(rightSample: ControllerFrameSample | null) {
-  if (!rightSample?.connected) {
+function updateControlFrameFromInput(
+  rightSample: ControllerFrameSample | null,
+  leftSample: ControllerFrameSample | null,
+  leftHandSample: HandFrameSample | null
+) {
+  const anchorSample = rightSample?.connected ? rightSample : leftSample?.connected ? leftSample : null;
+  if (!anchorSample?.connected) {
     controlFrame.active = false;
     controlFrame.hasAdjustReference = false;
+    controlFrame.adjustSource = null;
     return;
   }
 
   if (!controlFrame.initialized) {
-    controlFrame.position.copy(rightSample.position);
-    controlFrame.quaternion.copy(rightSample.quaternion).normalize();
+    controlFrame.position.copy(anchorSample.position);
+    setYawQuaternion(controlFrame.quaternion, extractYawRadians(anchorSample.rawQuaternion));
     controlFrame.initialized = true;
     controlFrame.fadeAlpha = 0;
   }
 
-  if (rightSample.thumbstickPressed) {
-    if (!controlFrame.hasAdjustReference) {
-      controlFrame.adjustStartPosition.copy(rightSample.position);
-      controlFrame.adjustStartQuaternion.copy(rightSample.quaternion).normalize();
-      controlFrame.hasAdjustReference = true;
-    } else {
-      scratchVecA.copy(rightSample.position).sub(controlFrame.adjustStartPosition);
-      controlFrame.position.add(scratchVecA);
-      controlFrame.adjustStartPosition.copy(rightSample.position);
+  const useRightControllerCalibration = Boolean(rightSample?.connected && rightSample.thumbstickPressed);
+  const useLeftHandCalibration =
+    !useRightControllerCalibration &&
+    runtimeConfigView.calibrationModeEnabled &&
+    Boolean(leftSample?.connected && leftHandSample?.touchIndex);
+  const calibrationSample = useRightControllerCalibration ? rightSample : useLeftHandCalibration ? leftSample : null;
+  const calibrationSource = useRightControllerCalibration ? 'right-controller' : useLeftHandCalibration ? 'left-hand' : null;
 
-      scratchQuatC
-        .copy(rightSample.quaternion)
-        .multiply(scratchQuatA.copy(controlFrame.adjustStartQuaternion).invert());
-      controlFrame.quaternion.premultiply(scratchQuatC).normalize();
-      controlFrame.adjustStartQuaternion.copy(rightSample.quaternion).normalize();
+  if (calibrationSample && calibrationSource) {
+    if (!controlFrame.hasAdjustReference || controlFrame.adjustSource !== calibrationSource) {
+      controlFrame.adjustStartPosition.copy(calibrationSample.position);
+      controlFrame.adjustStartQuaternion.copy(calibrationSample.rawQuaternion).normalize();
+      controlFrame.hasAdjustReference = true;
+      controlFrame.adjustSource = calibrationSource;
+    } else {
+      scratchVecA.copy(calibrationSample.position).sub(controlFrame.adjustStartPosition);
+      controlFrame.position.add(scratchVecA);
+      controlFrame.adjustStartPosition.copy(calibrationSample.position);
+
+      const currentYaw = extractYawRadians(calibrationSample.rawQuaternion);
+      const startYaw = extractYawRadians(controlFrame.adjustStartQuaternion);
+      const deltaYaw = normalizeAngleRadians(currentYaw - startYaw);
+      controlFrame.quaternion.premultiply(setYawQuaternion(scratchQuatC, deltaYaw)).normalize();
+      controlFrame.adjustStartQuaternion.copy(calibrationSample.rawQuaternion).normalize();
     }
     controlFrame.active = true;
     controlFrame.fadeAlpha = 1;
@@ -851,6 +934,7 @@ function updateControlFrameFromInput(rightSample: ControllerFrameSample | null) 
   if (controlFrame.active) {
     controlFrame.active = false;
     controlFrame.hasAdjustReference = false;
+    controlFrame.adjustSource = null;
     controlFrame.lastReleaseMs = Date.now();
   }
 }
@@ -887,7 +971,7 @@ function handlePanelInput(rightSample: ControllerFrameSample | null) {
     return;
   }
 
-  const triggerPressed = rightSample.triggerValue >= 0.72;
+  const triggerPressed = rightSample.triggerValue >= TRIGGER_PRESS_THRESHOLD;
   const squeezePressed = rightSample.squeezeValue >= 0.55;
 
   if (squeezePressed && rightSample.primaryPressed && !buttonHistory.right.primary) {
@@ -988,9 +1072,9 @@ function togglePanel(key: keyof typeof panels, sample: ControllerFrameSample) {
 }
 
 function movePanelToController(panel: WorldPanel, sample: ControllerFrameSample, distance: number, upOffset: number, sideOffset: number) {
-  scratchVecA.set(0, 0, -1).applyQuaternion(sample.quaternion).multiplyScalar(distance);
-  scratchVecB.set(0, 1, 0).applyQuaternion(sample.quaternion).multiplyScalar(upOffset);
-  scratchVecC.set(1, 0, 0).applyQuaternion(sample.quaternion).multiplyScalar(sideOffset);
+  scratchVecA.copy(txLocalAxisY).applyQuaternion(sample.quaternion).multiplyScalar(distance);
+  scratchVecB.copy(txLocalAxisZ).applyQuaternion(sample.quaternion).multiplyScalar(upOffset);
+  scratchVecC.copy(txLocalAxisX).applyQuaternion(sample.quaternion).multiplyScalar(sideOffset);
 
   panel.root.position.copy(sample.position).add(scratchVecA).add(scratchVecB).add(scratchVecC);
   getViewerWorldPosition(scratchHead);
@@ -999,7 +1083,7 @@ function movePanelToController(panel: WorldPanel, sample: ControllerFrameSample,
 
 function raycastPanelButton(panel: WorldPanel, sample: ControllerFrameSample): PanelButton | null {
   scratchVecA.copy(sample.position);
-  scratchVecB.set(0, 0, -1).applyQuaternion(sample.quaternion).normalize();
+  scratchVecB.copy(txLocalAxisY).applyQuaternion(sample.quaternion).normalize();
   raycaster.set(scratchVecA, scratchVecB);
   const intersections = raycaster.intersectObject(panel.mesh, false);
   if (intersections.length === 0) {
@@ -1052,13 +1136,14 @@ function drawDebugPanel(panel: WorldPanel) {
   const lines = [
     `右手连接: ${right.connected ? '是' : '否'}    左手连接: ${left.connected ? '是' : '否'}`,
     `手势功能: ${handGestureState.featureEnabled ? '启用' : '禁用'}  跟踪: ${boolLabel(handGestureState.handTracked)}  模式: ${boolLabel(handGestureState.active)}`,
+    `校准模式: ${boolLabel(runtimeConfigView.calibrationModeEnabled)}  左手手势校准: ${runtimeConfigView.calibrationModeEnabled ? '可用' : '关闭'}`,
     `ABS 位置(mm): ${formatVec3(right.rawPositionMm)}`,
     `REL 位置(mm): ${formatVec3(right.relPositionMm)}`,
     `ABS 四元数(wxyz): ${formatQuat(right.rawQuaternionWxyz)}`,
     `REL 四元数(wxyz): ${formatQuat(right.relQuaternionWxyz)}`,
     `摇杆: (${right.joyX}, ${right.joyY})    Trigger=${right.triggerValue.toFixed(2)}    Squeeze=${right.squeezeValue.toFixed(2)}`,
     `A=${boolLabel(right.primaryPressed)}  B=${boolLabel(right.secondaryPressed)}  Stick=${boolLabel(right.thumbstickPressed)}`,
-    `掌心向上=${boolLabel(handGestureState.palmUp)}  展平=${boolLabel(handGestureState.openHand)}  静止=${boolLabel(handGestureState.still)}  冷却=${boolLabel(handGestureState.cooldownActive)}  W(KEY6)=${boolLabel(handGestureState.touchMiddle)}  X(KEY7)=${boolLabel(handGestureState.touchRing)}`
+    `掌心向上=${boolLabel(handGestureState.palmUp)}  展平=${boolLabel(handGestureState.openHand)}  静止=${boolLabel(handGestureState.still)}  W(KEY6)=${boolLabel(handGestureState.touchMiddle)}  X(KEY7)=${boolLabel(handGestureState.touchRing)}`
   ];
 
   drawKeyValueLines(ctx, lines, 54, 192, 42);
@@ -1101,12 +1186,13 @@ function drawInfoPanel(panel: WorldPanel) {
   drawPanelTitle(ctx, panel);
   drawPanelParagraph(ctx, 54, 126, 'A+B 切换本面板；A/B + Squeeze 可移动其它面板；Trigger 映射为 KEY5。');
 
-  drawPanelParagraph(ctx, 54, 126, '纯手势模式下可启用右手手势按键：掌心向上、五指完全展平并近乎静止 300ms 后激活；激活后按较宽松的基础姿势标准保持。');
+  drawPanelParagraph(ctx, 54, 126, '纯手势模式下可启用右手手势按键：掌心向上、五指完全展平并近乎静止 300ms 后激活；激活后按更宽松阈值保持。');
 
   const sections = [
     `传输: ${transport.statusLabel}    模式: ${currentSessionMode.value}`,
     `发送频率: ${sendHz} Hz    坐标轴淡出: ${(fade * 100).toFixed(0)}%`,
     `PC 倍率: 平移 x${runtimeConfigView.positionScale.toFixed(2)} / 旋转 x${runtimeConfigView.rotationScale.toFixed(2)}`,
+    `校准模式: ${boolLabel(runtimeConfigView.calibrationModeEnabled)}  左手捏合可做无手柄坐标校准`,
     `坐标系原点(mm): ${formatVec3(vectorMetersToMmTuple(controlFrame.position))}`,
     `坐标系四元数(wxyz): ${formatQuat(threeQuatToWxyzTuple(controlFrame.quaternion))}`,
     `面板: 调试=${boolLabel(panels.debug.visible)}  按键=${boolLabel(panels.keys.visible)}  状态=${boolLabel(panels.info.visible)}`,
@@ -1150,6 +1236,15 @@ function updateControllerVisual(handedness: Handedness, sample: ControllerFrameS
   visual.root.position.copy(sample.position);
   visual.root.quaternion.copy(sample.quaternion);
   visual.root.scale.setScalar(1);
+
+  const triggerBlend = clampNumber(sample.triggerValue / TRIGGER_PRESS_THRESHOLD, 0, 1);
+  visual.directionArrowMaterial.color
+    .copy(visual.directionArrowIdleColor)
+    .lerp(visual.directionArrowPressedColor, triggerBlend);
+  visual.directionArrowMaterial.emissive
+    .copy(visual.directionArrowIdleColor)
+    .lerp(visual.directionArrowPressedColor, triggerBlend);
+  visual.directionArrowMaterial.emissiveIntensity = 0.24 + triggerBlend * 0.86;
 
   const accent = handedness === 'left' ? '#38bdf8' : '#f97316';
   redrawSpriteTag(visual.header, handedness === 'left' ? '左手' : '右手', accent);
@@ -1211,7 +1306,8 @@ function updateUiSummary() {
     `运行模式: ${currentSessionMode.value}`,
     `右手连接: ${right.connected ? '是' : '否'}`,
     `手势功能: ${handGestureState.featureEnabled ? '启用' : '禁用'} / 跟踪=${boolLabel(handGestureState.handTracked)} / 模式=${boolLabel(handGestureState.active)}`,
-    `手势状态: 掌心向上=${boolLabel(handGestureState.palmUp)} / 展平=${boolLabel(handGestureState.openHand)} / 静止=${boolLabel(handGestureState.still)} / 冷却=${boolLabel(handGestureState.cooldownActive)} / W=${boolLabel(handGestureState.touchMiddle)} / X=${boolLabel(handGestureState.touchRing)}`,
+    `校准模式: ${boolLabel(runtimeConfigView.calibrationModeEnabled)}`,
+    `手势状态: 掌心向上=${boolLabel(handGestureState.palmUp)} / 展平=${boolLabel(handGestureState.openHand)} / 静止=${boolLabel(handGestureState.still)} / W=${boolLabel(handGestureState.touchMiddle)} / X=${boolLabel(handGestureState.touchRing)}`,
     `坐标系原点(mm): ${formatVec3(vectorMetersToMmTuple(controlFrame.position))}`,
     `坐标系淡出: ${(controlFrame.fadeAlpha * 100).toFixed(0)}%`,
     `摇杆: (${right.joyX}, ${right.joyY})`,
@@ -1223,7 +1319,8 @@ function updateUiSummary() {
     '- B：切换按键面板，B+Squeeze：移动按键面板',
     '- A+B：切换状态面板，A+B+Squeeze：移动状态面板',
     '- Trigger：发送 KEY5 / deltaKey',
-    `- 右手纯手势模式${ENABLE_HAND_GESTURE_KEYS ? '已启用' : '已禁用'}：掌心向上、五指完全展平并近乎静止 300ms 后激活；手势触发后有 1 秒不应期`
+    `- 右手纯手势模式${ENABLE_HAND_GESTURE_KEYS ? '已启用' : '已禁用'}：掌心向上、五指完全展平并近乎静止 300ms 后激活；激活后拇指碰中指=KEY6，碰无名指=KEY7`,
+    '- 开启“校准模式”后，左手拇指-食指捏合作为无手柄坐标校准使能；左右两种校准都只调整位置 + yaw'
   ].join('\n');
 }
 
@@ -1248,6 +1345,13 @@ function createControllerVisual(handedness: Handedness): ControllerVisual {
   root.visible = false;
 
   const accent = handedness === 'left' ? 0x38bdf8 : 0xf97316;
+
+  const body = new THREE.Group();
+  body.position.set(0, -0.01, 0);
+  // Rotate the controller body so its long axis matches local +Y forward.
+  body.rotation.x = -Math.PI / 2;
+  root.add(body);
+
   const shell = new THREE.Mesh(
     new THREE.CylinderGeometry(0.017, 0.022, 0.12, 18),
     new THREE.MeshStandardMaterial({
@@ -1256,9 +1360,7 @@ function createControllerVisual(handedness: Handedness): ControllerVisual {
       metalness: 0.08
     })
   );
-  shell.rotation.x = Math.PI / 2;
-  shell.position.set(0, -0.01, 0);
-  root.add(shell);
+  body.add(shell);
 
   const ring = new THREE.Mesh(
     new THREE.TorusGeometry(0.045, 0.006, 10, 32),
@@ -1270,15 +1372,32 @@ function createControllerVisual(handedness: Handedness): ControllerVisual {
     })
   );
   ring.rotation.x = Math.PI / 2;
-  ring.position.set(0, 0.04, -0.01);
-  root.add(ring);
+  ring.position.set(0, 0.016, 0);
+  body.add(ring);
 
-  root.add(makeArrow(new THREE.Vector3(1, 0, 0), 0xff4d4f));
-  root.add(makeArrow(new THREE.Vector3(0, 1, 0), 0x22c55e));
-  root.add(makeArrow(new THREE.Vector3(0, 0, 1), 0x3b82f6));
+  const directionArrowIdleColor = new THREE.Color(handedness === 'left' ? 0x7dd3fc : 0xfdba74);
+  const directionArrowPressedColor = new THREE.Color(0xfacc15);
+  const directionArrowMaterial = new THREE.MeshStandardMaterial({
+    color: directionArrowIdleColor.clone(),
+    emissive: directionArrowIdleColor.clone(),
+    emissiveIntensity: 0.24,
+    roughness: 0.28,
+    metalness: 0.06
+  });
+  const directionArrow = new THREE.Mesh(
+    new THREE.ConeGeometry(0.018, 0.05, 24),
+    directionArrowMaterial
+  );
+  directionArrow.position.set(0, 0.085, 0);
+  body.add(directionArrow);
+
+  // Display the handle/local attitude frame directly: X right, Y forward, Z up.
+  root.add(makeArrow(txLocalAxisX, 0xff4d4f));
+  root.add(makeArrow(txLocalAxisY, 0x22c55e));
+  root.add(makeArrow(txLocalAxisZ, 0x3b82f6));
 
   const ray = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.28)]),
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), txLocalAxisY.clone().multiplyScalar(0.28)]),
     new THREE.LineBasicMaterial({
       color: handedness === 'left' ? 0x67e8f9 : 0xfdba74,
       transparent: true,
@@ -1292,7 +1411,13 @@ function createControllerVisual(handedness: Handedness): ControllerVisual {
   root.add(header);
 
   primeMaterialOpacity(root);
-  return { root, header };
+  return {
+    root,
+    header,
+    directionArrowMaterial,
+    directionArrowIdleColor,
+    directionArrowPressedColor
+  };
 }
 
 function createHandGestureVisual(): HandGestureVisual {
@@ -1342,12 +1467,15 @@ function createFingerMarker(color: number) {
 function buildControlFrameVisual() {
   const root = new THREE.Group();
 
+  // GridHelper is native-XZ/y=0, which is exactly the transmitted world
+  // frame's horizontal XY plane because outgoing +Z maps to native +Y.
   const grid = new THREE.GridHelper(1.3, 14, 0x7dd3fc, 0x1f3145);
   grid.position.y = -0.001;
   root.add(grid);
 
-  const axes = new THREE.AxesHelper(0.38);
-  root.add(axes);
+  root.add(makeArrow(txWorldAxisX, 0xff4d4f));
+  root.add(makeArrow(txWorldAxisY, 0x22c55e));
+  root.add(makeArrow(txWorldAxisZ, 0x3b82f6));
 
   const marker = new THREE.Mesh(
     new THREE.SphereGeometry(0.022, 18, 18),
@@ -1650,10 +1778,6 @@ function resetControllers() {
   handGestureState.touchMiddle = false;
   handGestureState.touchRing = false;
   handGestureState.keyFlags = 0;
-  handGestureState.cooldownUntilMs = 0;
-  handGestureState.cooldownActive = false;
-  handGestureState.previousRawTouchMiddle = false;
-  handGestureState.previousRawTouchRing = false;
   handGestureState.hasPreviousPose = false;
 }
 
@@ -1670,6 +1794,7 @@ function resetControlFrame() {
   controlFrame.adjustStartPosition.set(0, 0, 0);
   controlFrame.adjustStartQuaternion.identity();
   controlFrame.hasAdjustReference = false;
+  controlFrame.adjustSource = null;
   controlFrame.fadeAlpha = 0;
   controlFrame.lastReleaseMs = 0;
   controlFrame.active = false;
@@ -1740,8 +1865,13 @@ function readHandJointPosition(frame: XRFrame, hand: XRHand, jointName: HandJoin
   return new THREE.Vector3(pose.transform.position.x, pose.transform.position.y, pose.transform.position.z);
 }
 
-function isFingerExtended(wrist: THREE.Vector3, tip: THREE.Vector3, proximal: THREE.Vector3) {
-  return tip.distanceTo(wrist) - proximal.distanceTo(wrist) >= HAND_GESTURE_FINGER_EXTEND_MARGIN_M;
+function isFingerExtended(
+  wrist: THREE.Vector3,
+  tip: THREE.Vector3,
+  proximal: THREE.Vector3,
+  margin = HAND_GESTURE_FINGER_EXTEND_MARGIN_M
+) {
+  return tip.distanceTo(wrist) - proximal.distanceTo(wrist) >= margin;
 }
 
 function isHandPoseStill(sample: HandFrameSample) {
@@ -1762,6 +1892,26 @@ function rememberHandPose(sample: HandFrameSample) {
     handGestureState.previousFingertips[finger].copy(sample.fingertips[finger]);
   }
   handGestureState.hasPreviousPose = true;
+}
+
+function extractYawRadians(quaternion: THREE.Quaternion) {
+  scratchVecA.copy(txLocalAxisY).applyQuaternion(quaternion);
+  return Math.atan2(-scratchVecA.x, -scratchVecA.z);
+}
+
+function setYawQuaternion(target: THREE.Quaternion, yawRadians: number) {
+  return target.setFromAxisAngle(worldUp, yawRadians).normalize();
+}
+
+function normalizeAngleRadians(value: number) {
+  let result = value;
+  while (result > Math.PI) {
+    result -= Math.PI * 2;
+  }
+  while (result < -Math.PI) {
+    result += Math.PI * 2;
+  }
+  return result;
 }
 
 function setFingerMarkerFeedback(
@@ -1805,22 +1955,28 @@ function mapAxisToPercent(value: number) {
 }
 
 function vectorMetersToMmTuple(vector: THREE.Vector3): Vec3Tuple {
-  // 【修复点】：将 Three.js (右手系, Y-Up) 转换为 目标系 (左手系, Z-Up)
-  // 原系统：X右, Y上, Z后
-  // 新系统：X右, Y后(+Z), Z上(Y)
+  // WebXR/OpenXR grip/world space uses +X right, +Y up, -Z forward.
+  // CCtrl's XR-side world/position frame is defined as a left-handed Z-up frame:
+  //   X' =  X
+  //   Y' =  Z
+  //   Z' =  Y
   return [
-    round3(vector.x * 1000),      // X 保持不动 (右)
-    round3(vector.z * 1000),      // Y 映射为原来的 +Z (后)
-    round3(vector.y * 1000)       // Z 映射为原来的 Y (上)
+    round3(vector.x * 1000),
+    round3(vector.z * 1000),
+    round3(vector.y * 1000)
   ];
 }
 
 function threeQuatToWxyzTuple(quaternion: THREE.Quaternion): QuatWxyzTuple {
+  // Handle/local attitude keeps the agreed IMU-like axis definition:
+  //   +X = native +X
+  //   +Y = native -Z
+  //   +Z = native +Y
   return [
     round3(quaternion.w),
-    round3(quaternion.x),      // 新 X 轴 = 原 X 轴 (右)
-    round3(-quaternion.z),     // 新 Y 轴 = 原 -Z 轴 (前)
-    round3(quaternion.y)       // 新 Z 轴 = 原 Y 轴 (上)
+    round3(quaternion.x),
+    round3(-quaternion.z),
+    round3(quaternion.y)
   ];
 }
 
@@ -1879,9 +2035,14 @@ async function refreshRuntimeConfig() {
   try {
     const response = await fetch('/runtime-config.json', { cache: 'no-store' });
     if (response.ok) {
-      const data = (await response.json()) as Partial<{ positionScale: number; rotationScale: number }>;
+      const data = (await response.json()) as Partial<{
+        positionScale: number;
+        rotationScale: number;
+        calibrationModeEnabled: boolean;
+      }>;
       runtimeConfigView.positionScale = Number(data.positionScale ?? 1);
       runtimeConfigView.rotationScale = Number(data.rotationScale ?? 1);
+      runtimeConfigView.calibrationModeEnabled = Boolean(data.calibrationModeEnabled ?? false);
       runtimeConfigView.lastFetchedAtMs = Date.now();
     }
   } catch {

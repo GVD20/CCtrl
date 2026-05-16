@@ -56,6 +56,7 @@ Quest Browser / Desktop Browser
 ### Python
 
 - `WebXR_link.py` 依赖：`textual`、`rich`、`pyfiglet`
+- Ubuntu 打包 / 部署时可直接使用 `requirements-webxr-link.txt`
 - 如果要配合桌面监控台使用，还需要根目录 `tools/preview_monitor.py` 的依赖：`PyQt5`、`PyQt-Fluent-Widgets`
 
 ### Android / Quest 辅助工具
@@ -64,6 +65,13 @@ Quest Browser / Desktop Browser
 - 或者让 `adb`、`gnirehtet` 进入 PATH
 
 > `platform-tools/` 只是本地运行辅助目录，不属于仓库必需源码。
+
+## Ubuntu Bundle
+
+- Ubuntu 即开即用部署说明见 `UBUNTU_DEPLOY_ZHCN.md`
+- Ubuntu bundle 打包器见 `ubuntu/package_ubuntu_bundle.py`
+- Ubuntu 一键构建脚本见 `ubuntu/build_on_ubuntu.sh`
+- `WebXR_link.py` 现支持 `--ui-scale` / `--ui-density` 以适配较小终端
 
 ## 常用命令
 

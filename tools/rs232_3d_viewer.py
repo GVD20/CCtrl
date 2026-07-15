@@ -35,6 +35,15 @@ RM_DATA_LEN = 30
 FRAME_LEN = 5 + 2 + RM_DATA_LEN + 2
 KEY5_MASK = 0x10
 
+# Match the transmitted/controller pose contract directly in the viewer:
+# the viewer world frame is left-handed with +Z up, while world-space Y is
+# flipped from the raw stream. Local/end-effector axes keep the streamed pose
+# basis and are not mirrored through this helper.
+
+
+def map_world_point_to_view(point: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    return (point[0], -point[1], point[2])
+
 
 def half_to_float(half_word: int) -> float:
     sign = -1.0 if (half_word & 0x8000) else 1.0
@@ -314,7 +323,7 @@ class ClutchedPose:
         key_active = bool(frame.delta_key or (frame.key_flags & KEY5_MASK))
 
         if not self._initialized:
-            self.display_pos = frame.pos
+            self.display_pos = map_world_point_to_view(frame.pos)
             self.display_quat = frame.quat
             self._initialized = True
 
@@ -325,7 +334,7 @@ class ClutchedPose:
             self._anchor_display_quat = self.display_quat
 
         if key_active:
-            delta_pos = vec_sub(frame.pos, self._anchor_raw_pos)
+            delta_pos = map_world_point_to_view(vec_sub(frame.pos, self._anchor_raw_pos))
             delta_quat = quat_mul(frame.quat, quat_inverse(self._anchor_raw_quat))
             self.display_pos = vec_add(self._anchor_display_pos, delta_pos)
             self.display_quat = quat_normalize(quat_mul(delta_quat, self._anchor_display_quat))
@@ -478,6 +487,21 @@ class CubeViewerWidget(QWidget):
         scale = self._focal_length / depth
         return (center_x + x_cam * scale, center_y - y_cam * scale, depth)
 
+    def _cube_center(self) -> Tuple[float, float, float]:
+        pos = self._display_pose.display_pos
+        return (-pos[0], -pos[1], pos[2])
+
+    def _display_space_point(self, point: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        return (point[0], -point[1], point[2])
+
+    def _local_display_point_to_world(
+        self,
+        point: Tuple[float, float, float],
+        quat: Tuple[float, float, float, float],
+        pos: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        return vec_add(rotate_point(self._display_space_point(point), quat), pos)
+
     def _build_cube_vertices(self) -> List[Tuple[float, float, float]]:
         half = self._cube_size * 0.5
         local = [
@@ -491,8 +515,8 @@ class CubeViewerWidget(QWidget):
             (-half, half, half),
         ]
         quat = self._display_pose.display_quat
-        pos = self._display_pose.display_pos
-        return [vec_add(rotate_point(vertex, quat), pos) for vertex in local]
+        pos = self._cube_center()
+        return [self._local_display_point_to_world(vertex, quat, pos) for vertex in local]
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.LeftButton:
@@ -573,7 +597,7 @@ class CubeViewerWidget(QWidget):
     def _draw_axes(self, painter: QPainter) -> None:
         origin = self._project((0.0, 0.0, 0.0))
         x_tip = self._project((120.0, 0.0, 0.0))
-        y_tip = self._project((0.0, 120.0, 0.0))
+        y_tip = self._project((0.0, -120.0, 0.0))
         z_tip = self._project((0.0, 0.0, 120.0))
 
         painter.setPen(QPen(self._palette["axis_x"], 2.2))
@@ -598,12 +622,12 @@ class CubeViewerWidget(QWidget):
         for a, b in edges:
             painter.drawLine(QPointF(projected[a][0], projected[a][1]), QPointF(projected[b][0], projected[b][1]))
 
-        center = self._display_pose.display_pos
+        center = self._cube_center()
         quat = self._display_pose.display_quat
         axis_targets = (
-            vec_add(center, rotate_point((60.0, 0.0, 0.0), quat)),
-            vec_add(center, rotate_point((0.0, 60.0, 0.0), quat)),
-            vec_add(center, rotate_point((0.0, 0.0, 60.0), quat)),
+            self._local_display_point_to_world((60.0, 0.0, 0.0), quat, center),
+            self._local_display_point_to_world((0.0, 60.0, 0.0), quat, center),
+            self._local_display_point_to_world((0.0, 0.0, 60.0), quat, center),
         )
         center_proj = self._project(center)
 
@@ -623,6 +647,7 @@ class CubeViewerWidget(QWidget):
         painter.setPen(self._palette["overlay"])
 
         lines = ["RS232 3D Viewer  |  Drag to orbit  |  Wheel to zoom  |  KEY5 acts as clutch"]
+        lines.append("World=Mapped Pose (left-handed, Z-up, Y flipped from raw)  |  Local axes follow the streamed pose quaternion")
 
         if frame is None:
             lines.append("Waiting for a valid RS232 frame...")

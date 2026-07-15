@@ -3,6 +3,7 @@
 #include "ice_melody_data.h"
 #include <WouoUiLiteGeneralBridge.h>
 #include <master_business.h>
+#include <tile_menu_audio.h>
 
 namespace {
 constexpr uint8_t PIN_LED_ERR = 42;
@@ -29,6 +30,9 @@ enum BuzzerSoundKind : uint8_t {
   BUZZER_SOUND_KEY_PRESS,
   BUZZER_SOUND_KEY5_PRESS,
   BUZZER_SOUND_KEY5_RELEASE,
+  BUZZER_SOUND_TILE_NAV_BACKWARD,
+  BUZZER_SOUND_TILE_NAV_FORWARD,
+  BUZZER_SOUND_TILE_CONFIRM,
 };
 
 struct BuzzerPlaybackState {
@@ -83,6 +87,28 @@ static constexpr BuzzerPwmStep kKey5ReleasePattern[] = {
 static constexpr size_t kKey5ReleasePatternCount =
     sizeof(kKey5ReleasePattern) / sizeof(kKey5ReleasePattern[0]);
 static constexpr uint32_t kKey5ReleaseGuardMs = 110;
+static constexpr BuzzerPwmStep kTileNavBackwardPattern[] = {
+    {523, 26},
+};
+static constexpr size_t kTileNavBackwardPatternCount =
+    sizeof(kTileNavBackwardPattern) / sizeof(kTileNavBackwardPattern[0]);
+static constexpr uint32_t kTileNavBackwardGuardMs = 80;
+static constexpr BuzzerPwmStep kTileNavForwardPattern[] = {
+    {1047, 26},
+};
+static constexpr size_t kTileNavForwardPatternCount =
+    sizeof(kTileNavForwardPattern) / sizeof(kTileNavForwardPattern[0]);
+static constexpr uint32_t kTileNavForwardGuardMs = 80;
+static constexpr BuzzerPwmStep kTileConfirmPattern[] = {
+    {523, 35},
+    {0, 12},
+    {659, 35},
+    {0, 12},
+    {784, 45},
+};
+static constexpr size_t kTileConfirmPatternCount =
+    sizeof(kTileConfirmPattern) / sizeof(kTileConfirmPattern[0]);
+static constexpr uint32_t kTileConfirmGuardMs = 180;
 
 static uint32_t scaleDurationForTempo(uint32_t durationMs) {
   if (durationMs == 0U || BOOT_MELODY_BASE_BPM == 0U ||
@@ -406,42 +432,36 @@ void startKey5ReleaseBuzzer() {
                         BUZZER_SOUND_KEY5_RELEASE);
 }
 
+} // namespace
+
+namespace TileMenuAudio {
+
+void playNavigateBackward() {
+  requestPromptPlayback(kTileNavBackwardPattern, kTileNavBackwardPatternCount,
+                        BUZZER_PWM_DUTY_KEY_PRESS, kTileNavBackwardGuardMs,
+                        false, BUZZER_SOUND_TILE_NAV_BACKWARD);
+}
+
+void playNavigateForward() {
+  requestPromptPlayback(kTileNavForwardPattern, kTileNavForwardPatternCount,
+                        BUZZER_PWM_DUTY_KEY_PRESS, kTileNavForwardGuardMs,
+                        false, BUZZER_SOUND_TILE_NAV_FORWARD);
+}
+
+void playConfirm() {
+  requestPromptPlayback(kTileConfirmPattern, kTileConfirmPatternCount,
+                        BUZZER_PWM_DUTY_LINK_OK, kTileConfirmGuardMs, false,
+                        BUZZER_SOUND_TILE_CONFIRM);
+}
+
+} // namespace TileMenuAudio
+
+namespace {
+
 bool gStatLedOn = false;
 unsigned long gLastBlinkMs = 0;
 TaskHandle_t gUiTaskHandle = nullptr;
 TaskHandle_t gBusinessTaskHandle = nullptr;
-
-static void renderXrStatusUi() {
-  XrWebSnapshot xr{};
-  MasterBusiness::getXrWebSnapshot(xr);
-
-  char line1[24] = {0};
-  char line2[24] = {0};
-  char line3[24] = {0};
-
-  if (!xr.hostLinked) {
-    snprintf(line1, sizeof(line1), "USB Wait Pose");
-    snprintf(line2, sizeof(line2), "Seq %lu", (unsigned long)xr.lastPacketSeq);
-    snprintf(line3, sizeof(line3), "OK Exit");
-  } else if (!xr.hasPose) {
-    snprintf(line1, sizeof(line1), "Host Linked");
-    snprintf(line2, sizeof(line2), "Pose warming");
-    snprintf(line3, sizeof(line3), "Seq %lu", (unsigned long)xr.lastPacketSeq);
-  } else {
-    snprintf(line1, sizeof(line1), "Host Ready");
-    snprintf(line2, sizeof(line2), "Seq %lu", (unsigned long)xr.lastPacketSeq);
-    snprintf(line3, sizeof(line3), "Age %lu ms",
-             (unsigned long)xr.lastPacketAgeMs);
-  }
-
-  if (xr.restorePending) {
-    snprintf(line3, sizeof(line3), "Restoring bus");
-  }
-
-  if (WouoUiLiteGeneral::xrStatusTick("XR-UART Mode", line1, line2, line3)) {
-    MasterBusiness::setXrWebMode(false);
-  }
-}
 
 void uiTask(void *) {
   WouoUiLiteGeneral::begin();
@@ -453,10 +473,7 @@ void uiTask(void *) {
     bool hasSnap = MasterBusiness::getMonitorSnapshot(snap);
     digitalWrite(PIN_LED_ERR, (hasSnap && snap.disconnectMode) ? HIGH : LOW);
 
-    if (MasterBusiness::getXrWebMode())
-      renderXrStatusUi();
-    else
-      WouoUiLiteGeneral::tick();
+    WouoUiLiteGeneral::tick();
 
     const unsigned long nowMs = millis();
     if ((nowMs - gLastBlinkMs) >= 400UL) {
@@ -465,7 +482,7 @@ void uiTask(void *) {
       digitalWrite(PIN_LED_STAT, gStatLedOn ? HIGH : LOW);
     }
 
-    vTaskDelay(MasterBusiness::getXrWebMode() ? 10 : 1);
+    vTaskDelay(1);
   }
 }
 

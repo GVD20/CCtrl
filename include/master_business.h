@@ -78,23 +78,15 @@ struct UiPopupState {
   char text[32] = {0};
 };
 
-struct XrWebSnapshot {
-  uint8_t enabled = 0;
-  uint8_t hasPose = 0;
-  uint8_t restorePending = 0;
-  uint8_t hostLinked = 0;
-  uint32_t lastPacketSeq = 0;
-  uint32_t lastPacketAgeMs = 0;
-};
-
 namespace MasterBusiness {
 void setup();
 void loop();
 bool getMonitorSnapshot(UiMonitorSnapshot &out);
 bool getUiPopupState(UiPopupState &out);
-bool getXrWebSnapshot(XrWebSnapshot &out);
-bool setXrWebMode(bool enabled);
-bool getXrWebMode();
+uint8_t getLocalKeyMaskRaw();
+bool setTileMenuActive(bool active);
+bool getTileMenuActive();
+bool triggerTileMenuCommand(uint8_t command);
 
 void startJoystickCalibration();
 void stopJoystickCalibration();

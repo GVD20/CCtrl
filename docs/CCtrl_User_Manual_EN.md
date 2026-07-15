@@ -66,7 +66,7 @@ SOF(0xA5)
 | 14..21 |      8 | att_h[4]   | float16[4] | attitude vector (Euler or Quaternion)      |
 |     22 |      1 | mode_flags | uint8      | output interface/pose mode/attitude format |
 | 23..28 |      6 | enc_raw[3] | uint16[3]  | calibrated encoder counts                  |
-|     29 |      1 | reserved   | uint8      | reserved, currently 0                      |
+|     29 |      1 | tile_cmd   | uint8      | TILE menu command pulse, 0 when idle       |
 
 ### 4.3 Key Bit Definitions
 

@@ -60,6 +60,8 @@
 #include <WouoUiLiteGeneralOfficial.h>
 #include <master_business.h>
 #include <stdio.h>
+#include <tile_menu_audio.h>
+#include <tile_menu_config.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
 #define SCL 4
@@ -82,6 +84,7 @@ enum {
   M_WINDOW,
   M_SLEEP,
   M_MAIN,
+  M_TILE_MENU,
   M_EDITOR,
   M_KNOB,
   M_KRF,
@@ -121,7 +124,6 @@ char option_line_if[MONITOR_LINE_BUF] = "- LinkOut: RS232";
 char option_line_pose[MONITOR_LINE_BUF] = "- PoseOut: REL";
 char option_line_rot[MONITOR_LINE_BUF] = "- RotOut: EUL";
 char option_line_boot_snd[MONITOR_LINE_BUF] = "- BootSnd: ON";
-char option_line_xr[MONITOR_LINE_BUF] = "- XR-Web: OFF";
 
 char joycal_line_inst[MONITOR_LINE_BUF] = "- Rotate stick continuously";
 char joycal_line_cur[MONITOR_LINE_BUF] = "- Cur X:050 Y:050";
@@ -138,8 +140,8 @@ char enc_line_tip[MONITOR_LINE_BUF] = "- Pick action below";
  * *************************************/
 
 M_SELECT main_menu[]{
-    {"[ Main Menu ]"}, {"- Monitor"},     {"- Calibration"},
-    {"- Options"},     {"- UI_settings"},
+    {"[ Main Menu ]"}, {"- TILE_MENU"}, {"- Monitor"},
+    {"- Calibration"}, {"- Options"},   {"- UI_settings"},
 };
 
 M_SELECT editor_menu[]{
@@ -159,7 +161,6 @@ M_SELECT knob_menu[]{
 M_SELECT krf_menu[]{
     {"[ Options ]"},    {"- Back"},        {option_line_if},
     {option_line_pose}, {option_line_rot}, {option_line_boot_snd},
-    {option_line_xr},
 };
 
 M_SELECT kpf_menu[]{
@@ -190,6 +191,36 @@ M_SELECT about_menu[]{
     {"- Ram: 20k"},      {"- Flash: 64k"},        {"- Freq: 72Mhz"},
     {"- Creator: RQNG"}, {"- Bili UID: 9182439"},
 };
+
+static bool isTileMenuEntryVisible(const TileMenuConfigEntry &entry) {
+  return entry.title != nullptr && entry.title[0] != '\0' &&
+         entry.icon != nullptr && entry.command != 0U;
+}
+
+static uint8_t tileMenuVisibleCount() {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < TileMenuConfig::kMaxItems; ++i) {
+    if (isTileMenuEntryVisible(TileMenuConfig::kItems[i])) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+static const TileMenuConfigEntry *tileMenuEntryAt(uint8_t visibleIndex) {
+  uint8_t currentIndex = 0;
+  for (uint8_t i = 0; i < TileMenuConfig::kMaxItems; ++i) {
+    const TileMenuConfigEntry &entry = TileMenuConfig::kItems[i];
+    if (!isTileMenuEntryVisible(entry)) {
+      continue;
+    }
+    if (currentIndex == visibleIndex) {
+      return &entry;
+    }
+    ++currentIndex;
+  }
+  return nullptr;
+}
 
 /************************************* 页面变量
  * *************************************/
@@ -236,6 +267,45 @@ struct {
 #define UI_SCALE_PX(v)                                                         \
   (((v) * UI_SCALE_NUM + (UI_SCALE_DEN / 2)) / UI_SCALE_DEN)
 #define UI_SCALE_ODD(v) (UI_SCALE_PX(v) | 1)
+
+#define TILE_B_FONT u8g2_font_helvB18_tr
+constexpr uint8_t TILE_B_TITLE_H = 18;
+constexpr uint8_t TILE_ICON_H = TileMenuConfig::kIconHeight;
+constexpr uint8_t TILE_ICON_W = TileMenuConfig::kIconWidth;
+constexpr uint8_t TILE_ICON_S = TileMenuConfig::kIconSpacing;
+constexpr uint8_t TILE_INDI_H = TileMenuConfig::kVisibleIndicatorHeight;
+constexpr uint8_t TILE_INDI_W = TileMenuConfig::kVisibleIndicatorWidth;
+constexpr uint8_t TILE_INDI_S = TileMenuConfig::kIndicatorTop;
+constexpr uint8_t TILE_ANIM_SPEED = 60;
+struct {
+  float title_y_calc = TILE_INDI_S + (TILE_INDI_H - TILE_B_TITLE_H) / 2 +
+                       TILE_B_TITLE_H * 2;
+  float title_y_trg_calc =
+      TILE_INDI_S + (TILE_INDI_H - TILE_B_TITLE_H) / 2 + TILE_B_TITLE_H;
+  int16_t temp = 0;
+  bool select_flag = false;
+  float icon_x = 0.0f;
+  float icon_x_trg = 0.0f;
+  float icon_y = 0.0f;
+  float icon_y_trg = 0.0f;
+  float indi_x = 0.0f;
+  float indi_x_trg = 0.0f;
+  float title_y = 0.0f;
+  float title_y_trg = 0.0f;
+} tile;
+uint8_t gTilePrevLocalKeys = 0;
+
+static int16_t tileWrappedRelativeSlot(uint8_t tileCount, uint8_t selectedIndex,
+                                       uint8_t itemIndex) {
+  int16_t relative = (int16_t)itemIndex - (int16_t)selectedIndex;
+  const int16_t half = (int16_t)tileCount / 2;
+  if (relative > half) {
+    relative -= tileCount;
+  } else if (relative < -half) {
+    relative += tileCount;
+  }
+  return relative;
+}
 
 // 列表变量
 // 默认参数
@@ -466,22 +536,27 @@ void window_value_init(const char title[], uint8_t select, uint8_t *value,
                        uint8_t index);
 void ui_param_init();
 void ui_init();
+void tile_param_init();
 void sleep_param_init();
 void setting_param_init();
 void window_param_init();
 void layer_init_in();
 void layer_init_out();
 void animation(float *a, float *a_trg, uint8_t n);
+void tile_animation(float *a, float *a_trg);
 void fade();
+void tile_show();
 void list_draw_krf(int n);
 void list_draw_kpf(int n);
 void list_draw_text_and_check_box(struct MENU arr[], int i);
 void list_show(struct MENU arr[], uint8_t ui_index);
 void window_show();
+bool tile_rotate_switch(uint8_t btnId);
 void list_rotate_switch();
 void window_proc();
 void sleep_proc();
 void main_proc();
+void tile_proc();
 void monitor_menu_refresh();
 void options_menu_refresh();
 void enc_cali_refresh_lines();
@@ -756,6 +831,7 @@ void ui_param_init() {
 // 列表类页面列表行数初始化，必须初始化的参数
 void ui_init() {
   ui.num[M_MAIN] = sizeof(main_menu) / sizeof(M_SELECT);
+  ui.num[M_TILE_MENU] = tileMenuVisibleCount();
   ui.num[M_EDITOR] = sizeof(editor_menu) / sizeof(M_SELECT);
   ui.num[M_KNOB] = sizeof(knob_menu) / sizeof(M_SELECT);
   ui.num[M_KRF] = sizeof(krf_menu) / sizeof(M_SELECT);
@@ -767,6 +843,20 @@ void ui_init() {
 
 /********************************* 分页面初始化函数
  * ********************************/
+
+void tile_param_init() {
+  ui.init = false;
+  tile.icon_x = 0;
+  tile.icon_x_trg = TILE_ICON_S;
+  tile.icon_y = -TILE_ICON_H;
+  tile.icon_y_trg = 0;
+  tile.indi_x = 0;
+  tile.indi_x_trg = TILE_INDI_W;
+  tile.title_y = tile.title_y_calc;
+  tile.title_y_trg = tile.title_y_trg_calc;
+  tile.select_flag = false;
+  gTilePrevLocalKeys = MasterBusiness::getLocalKeyMaskRaw();
+}
 
 // 进入睡眠时的初始化
 void sleep_param_init() {
@@ -827,6 +917,10 @@ void layer_init_in() {
   list.bar_y = 0;
   ui.state = S_FADE;
   switch (ui.index) {
+  case M_TILE_MENU:
+    MasterBusiness::setTileMenuActive(true);
+    tile_param_init();
+    break;
   case M_KNOB:
     knob_param_init();
     break; // 旋钮设置页，行末尾文字初始化
@@ -938,6 +1032,92 @@ void fade() {
 
 /************************************* 显示函数
  * *************************************/
+
+void tile_animation(float *a, float *a_trg) {
+  if (*a != *a_trg) {
+    if (fabs(*a - *a_trg) < 0.15f) {
+      *a = *a_trg;
+    } else {
+      *a += (*a_trg - *a) / (TILE_ANIM_SPEED / 10.0f);
+    }
+  }
+}
+
+void tile_show() {
+  const uint8_t tileCount = ui.num[M_TILE_MENU];
+  if (tileCount == 0U) {
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.drawStr(2, 14, "TILE_MENU");
+    u8g2.drawHLine(0, 18, DISP_W);
+    u8g2.drawStr(2, 34, "No visible tiles");
+    u8g2.drawStr(2, 62, "Hold OK to exit");
+    u8g2.setDrawColor(2);
+    if (!ui.param[DARK_MODE]) {
+      u8g2.drawBox(0, 0, DISP_W, DISP_H);
+    }
+    return;
+  }
+
+  if (ui.select[ui.layer] >= tileCount) {
+    ui.select[ui.layer] = 0;
+  }
+
+  const TileMenuConfigEntry *currentEntry = tileMenuEntryAt(ui.select[ui.layer]);
+  if (!currentEntry) {
+    return;
+  }
+
+  tile_animation(&tile.icon_x, &tile.icon_x_trg);
+  tile_animation(&tile.icon_y, &tile.icon_y_trg);
+  tile_animation(&tile.indi_x, &tile.indi_x_trg);
+  tile_animation(&tile.title_y, &tile.title_y_trg);
+
+  u8g2.setDrawColor(1);
+  u8g2.setFont(TILE_B_FONT);
+  u8g2.drawStr(((DISP_W - TILE_INDI_W) - u8g2.getStrWidth(currentEntry->title)) /
+                       2 +
+                   TILE_INDI_W,
+               (int16_t)tile.title_y, currentEntry->title);
+  u8g2.drawBox(0, TILE_ICON_S, (int16_t)tile.indi_x, TILE_INDI_H);
+
+  if (!ui.init) {
+    for (uint8_t i = 0; i < tileCount; ++i) {
+      const TileMenuConfigEntry *entry = tileMenuEntryAt(i);
+      if (!entry) {
+        continue;
+      }
+      const int16_t relativeSlot =
+          tileWrappedRelativeSlot(tileCount, ui.select[ui.layer], i);
+      tile.temp =
+          (DISP_W - TILE_ICON_W) / 2 + (int16_t)(relativeSlot * tile.icon_x);
+      u8g2.drawXBMP(tile.temp, (int16_t)tile.icon_y, TILE_ICON_W, TILE_ICON_H,
+                    entry->icon);
+    }
+    if (tile.icon_x == tile.icon_x_trg) {
+      ui.init = true;
+      tile.icon_x = 0.0f;
+      tile.icon_x_trg = 0.0f;
+    }
+  } else {
+    for (uint8_t i = 0; i < tileCount; ++i) {
+      const TileMenuConfigEntry *entry = tileMenuEntryAt(i);
+      if (!entry) {
+        continue;
+      }
+      const int16_t relativeSlot =
+          tileWrappedRelativeSlot(tileCount, ui.select[ui.layer], i);
+      u8g2.drawXBMP((DISP_W - TILE_ICON_W) / 2 +
+                        relativeSlot * TILE_ICON_S + (int16_t)tile.icon_x,
+                    0, TILE_ICON_W, TILE_ICON_H, entry->icon);
+    }
+  }
+
+  u8g2.setDrawColor(2);
+  if (!ui.param[DARK_MODE]) {
+    u8g2.drawBox(0, 0, DISP_W, DISP_H);
+  }
+}
 
 /*************** 根据列表每行开头符号，判断每行尾部是否绘制以及绘制什么内容
  * *************/
@@ -1126,6 +1306,37 @@ void window_show() {
 /*********************************** 通用处理函数
  * ***********************************/
 
+bool tile_rotate_switch(uint8_t btnId) {
+  const uint8_t tileCount = ui.num[M_TILE_MENU];
+  if (!ui.init || tileCount <= 1U) {
+    return false;
+  }
+
+  switch (btnId) {
+  case BTN_ID_CC:
+    if (ui.select[ui.layer] > 0U)
+      ui.select[ui.layer] -= 1U;
+    else
+      ui.select[ui.layer] = (uint8_t)(tileCount - 1U);
+    tile.icon_x -= TILE_ICON_S;
+    tile.icon_x_trg = 0.0f;
+    tile.select_flag = false;
+    return true;
+
+  case BTN_ID_CW:
+    if (ui.select[ui.layer] < (tileCount - 1U))
+      ui.select[ui.layer] += 1U;
+    else
+      ui.select[ui.layer] = 0U;
+    tile.icon_x += TILE_ICON_S;
+    tile.icon_x_trg = 0.0f;
+    tile.select_flag = false;
+    return true;
+  }
+
+  return false;
+}
+
 // 列表类页面旋转时判断通用函数
 void list_rotate_switch() {
   if (!list.loop) {
@@ -1307,22 +1518,77 @@ void main_proc() {
         ui.state = S_LAYER_OUT;
         break;
       case 1:
-        ui.index = M_EDITOR;
+        ui.index = M_TILE_MENU;
         ui.state = S_LAYER_IN;
         break;
       case 2:
-        ui.index = M_KNOB;
+        ui.index = M_EDITOR;
         ui.state = S_LAYER_IN;
         break;
       case 3:
-        ui.index = M_KRF;
+        ui.index = M_KNOB;
         ui.state = S_LAYER_IN;
         break;
       case 4:
+        ui.index = M_KRF;
+        ui.state = S_LAYER_IN;
+        break;
+      case 5:
         ui.index = M_SETTING;
         ui.state = S_LAYER_IN;
         break;
       }
+    }
+  }
+}
+
+void tile_proc() {
+  tile_show();
+
+  const uint8_t tileCount = ui.num[M_TILE_MENU];
+  const uint8_t localKeys = (uint8_t)(MasterBusiness::getLocalKeyMaskRaw() & 0x0F);
+  const uint8_t localKeyEdges = (uint8_t)(localKeys & (uint8_t)~gTilePrevLocalKeys);
+  gTilePrevLocalKeys = localKeys;
+
+  if (btn.pressed) {
+    const uint8_t btnId = btn.id;
+    btn.pressed = false;
+    if (btnId == BTN_ID_LP) {
+      MasterBusiness::setTileMenuActive(false);
+      ui.index = M_MAIN;
+      ui.state = S_LAYER_OUT;
+      return;
+    }
+  }
+
+  if (tileCount == 0U) {
+    return;
+  }
+
+  if ((localKeyEdges & 0x01U) != 0U) {
+    if (tile_rotate_switch(BTN_ID_CW)) {
+      TileMenuAudio::playNavigateForward();
+      if (ui.init) {
+        tile.indi_x = 0;
+        tile.title_y = tile.title_y_calc;
+      }
+    }
+  }
+
+  if ((localKeyEdges & 0x02U) != 0U) {
+    if (tile_rotate_switch(BTN_ID_CC)) {
+      TileMenuAudio::playNavigateBackward();
+      if (ui.init) {
+        tile.indi_x = 0;
+        tile.title_y = tile.title_y_calc;
+      }
+    }
+  }
+
+  if ((localKeyEdges & 0x04U) != 0U) {
+    const TileMenuConfigEntry *entry = tileMenuEntryAt(ui.select[ui.layer]);
+    if (entry != nullptr && MasterBusiness::triggerTileMenuCommand(entry->command)) {
+      TileMenuAudio::playConfirm();
     }
   }
 }
@@ -1408,7 +1674,6 @@ void options_menu_refresh() {
   const uint8_t pose = MasterBusiness::getPoseMode();
   const uint8_t rot = MasterBusiness::getRotationOutputMode();
   const bool bootSnd = MasterBusiness::getBootSoundEnabled();
-  const bool xrMode = MasterBusiness::getXrWebMode();
 
   snprintf(option_line_if, MONITOR_LINE_BUF, "- LinkOut: %s",
            (outIf == MB_OUTPUT_IF_USB) ? "USB" : "RS232");
@@ -1418,8 +1683,6 @@ void options_menu_refresh() {
            (rot == MB_ROT_OUT_QUATERNION) ? "QUAT" : "EUL");
   snprintf(option_line_boot_snd, MONITOR_LINE_BUF, "- BootSnd: %s",
            bootSnd ? "ON" : "OFF");
-  snprintf(option_line_xr, MONITOR_LINE_BUF, "- XR-Web: %s",
-           xrMode ? "ON" : "OFF");
 }
 
 void enc_cali_refresh_lines() {
@@ -1572,9 +1835,6 @@ void krf_proc() {
       case 5:
         MasterBusiness::setBootSoundEnabled(
             !MasterBusiness::getBootSoundEnabled());
-        break;
-      case 6:
-        MasterBusiness::setXrWebMode(!MasterBusiness::getXrWebMode());
         break;
       }
     }
@@ -1815,6 +2075,9 @@ void ui_proc() {
     case M_MAIN:
       main_proc();
       break;
+    case M_TILE_MENU:
+      tile_proc();
+      break;
     case M_EDITOR:
       editor_proc();
       break;
@@ -1858,7 +2121,9 @@ void oled_init() {
 }
 
 void wououi_lite_general_setup() {
+#if !defined(ARDUINO_ARCH_ESP32)
   Serial.begin(115200);
+#endif
   eeprom_init();
   ui_init();
   oled_init();
@@ -1877,77 +2142,10 @@ void wououi_lite_general_loop() {
   ui_proc();
 }
 
-static bool xr_status_tick_impl(const char *title, const char *line1,
-                                const char *line2, const char *line3) {
-  static char lastTitle[24] = {0};
-  static char lastLine1[24] = {0};
-  static char lastLine2[24] = {0};
-  static char lastLine3[24] = {0};
-  static bool firstDraw = true;
-
-  btn_scan();
-  bool exitRequested = false;
-  if (btn.pressed) {
-    if (btn.id == BTN_ID_SP || btn.id == BTN_ID_LP) {
-      exitRequested = true;
-    }
-    btn.pressed = false;
-  }
-
-  auto copyLine = [](char *dst, size_t dstSize, const char *src) {
-    if (!dst || dstSize == 0)
-      return;
-    if (!src)
-      src = "";
-    snprintf(dst, dstSize, "%s", src);
-  };
-
-  char nextTitle[24] = {0};
-  char nextLine1[24] = {0};
-  char nextLine2[24] = {0};
-  char nextLine3[24] = {0};
-  copyLine(nextTitle, sizeof(nextTitle), title ? title : "XR-Web Mode");
-  copyLine(nextLine1, sizeof(nextLine1), line1);
-  copyLine(nextLine2, sizeof(nextLine2), line2);
-  copyLine(nextLine3, sizeof(nextLine3), line3);
-
-  const bool changed =
-      firstDraw || strcmp(lastTitle, nextTitle) != 0 ||
-      strcmp(lastLine1, nextLine1) != 0 || strcmp(lastLine2, nextLine2) != 0 ||
-      strcmp(lastLine3, nextLine3) != 0;
-
-  if (changed) {
-    copyLine(lastTitle, sizeof(lastTitle), nextTitle);
-    copyLine(lastLine1, sizeof(lastLine1), nextLine1);
-    copyLine(lastLine2, sizeof(lastLine2), nextLine2);
-    copyLine(lastLine3, sizeof(lastLine3), nextLine3);
-    firstDraw = false;
-
-    u8g2.clearBuffer();
-    u8g2.setDrawColor(1);
-    u8g2.setFont(u8g2_font_6x12_tf);
-    u8g2.drawStr(2, 11, lastTitle);
-    u8g2.drawHLine(0, 14, DISP_W);
-    u8g2.drawStr(2, 28, lastLine1);
-    u8g2.drawStr(2, 41, lastLine2);
-    u8g2.drawStr(2, 54, lastLine3);
-    u8g2.drawHLine(0, 56, DISP_W);
-    u8g2.drawStr(2, 64, "OK Exit");
-    u8g2.sendBuffer();
-  }
-
-  return exitRequested;
-}
-
 namespace WouoUiLiteGeneralOfficial {
 
 void setup() { wououi_lite_general_setup(); }
 
 void loop() { wououi_lite_general_loop(); }
-
-bool xrStatusTick(const char *title, const char *line1, const char *line2,
-                  const char *line3) {
-  return xr_status_tick_impl(title, line1, line2, line3);
-}
 
 } // namespace WouoUiLiteGeneralOfficial

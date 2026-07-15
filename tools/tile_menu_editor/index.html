@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CCtrl TILE Menu Editor</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">CCtrl Local Tool</p>
+          <h1>TILE Menu Editor</h1>
+          <p class="subtitle">
+            编辑 15 个磁贴槽位的标题、cmd 和 30x30 二值图标，直接写回
+            <code>tile_menu_config.h</code>
+          </p>
+        </div>
+        <div class="topbar-actions">
+          <label class="path-field">
+            <span>配置头文件</span>
+            <input id="pathInput" type="text" value="include/tile_menu_config.h" />
+          </label>
+          <div class="action-row">
+            <button id="loadButton" class="primary">加载</button>
+            <button id="saveButton" class="accent">保存</button>
+          </div>
+          <p id="statusText" class="status idle">尚未加载</p>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="slot-panel card">
+          <div class="card-head">
+            <h2>磁贴槽位</h2>
+            <p>标题非空且 <code>cmd != 0</code> 时会显示</p>
+          </div>
+          <div class="slot-actions">
+            <button id="moveUpButton" class="tool-button" type="button">上移当前项</button>
+            <button id="moveDownButton" class="tool-button" type="button">下移当前项</button>
+          </div>
+          <div id="slotList" class="slot-list"></div>
+        </aside>
+
+        <section class="editor-panel">
+          <div class="card form-card">
+            <div class="card-head">
+              <h2>当前槽位</h2>
+              <p id="slotMeta">槽位 01</p>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>名称</span>
+                <input id="titleInput" type="text" maxlength="31" />
+              </label>
+              <label>
+                <span>命令值</span>
+                <input id="commandInput" type="number" min="0" max="255" step="1" />
+              </label>
+              <div class="field readonly">
+                <span>显示状态</span>
+                <strong id="visibleState">隐藏</strong>
+              </div>
+              <div class="field readonly">
+                <span>十六进制</span>
+                <strong id="commandHex">0x00</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="canvas-layout">
+            <div class="card canvas-card">
+              <div class="card-head">
+                <h2>30x30 二值图标</h2>
+                <p>左键拖动绘制，当前工具只会产生 0/1 两种像素</p>
+              </div>
+              <div class="tool-row">
+                <button data-tool="draw" class="tool-button active">画笔</button>
+                <button data-tool="erase" class="tool-button">橡皮</button>
+                <button id="importButton" class="tool-button" type="button">导入图片</button>
+                <button id="clearButton" class="tool-button">清空</button>
+                <button id="invertButton" class="tool-button">反相</button>
+                <button id="fillButton" class="tool-button">填满</button>
+                <button id="flipHButton" class="tool-button">左右翻转</button>
+                <button id="flipVButton" class="tool-button">上下翻转</button>
+              </div>
+              <input id="imageFileInput" type="file" accept="image/*" hidden />
+              <div class="import-controls">
+                <label class="range-field">
+                  <span>二值阈值</span>
+                  <input id="thresholdRange" type="range" min="0" max="255" step="1" value="128" />
+                </label>
+                <strong id="thresholdValue" class="range-value">128</strong>
+                <label class="checkbox-field">
+                  <input id="importInvertCheckbox" type="checkbox" />
+                  <span>导入时反相</span>
+                </label>
+              </div>
+              <p id="importInfoText" class="import-info">未导入源图片</p>
+              <canvas id="iconCanvas" width="450" height="450"></canvas>
+            </div>
+
+            <div class="card preview-card">
+              <div class="card-head">
+                <h2>预览</h2>
+                <p>对应 OLED 的 1-bit 图像概念，不是灰度图</p>
+              </div>
+              <div class="preview-stack">
+                <div class="preview-block">
+                  <p class="preview-label">导入源缩放</p>
+                  <canvas id="sourceCanvas" width="120" height="120"></canvas>
+                </div>
+                <div class="preview-block">
+                  <p class="preview-label">二值结果</p>
+                  <canvas id="previewCanvas" width="120" height="120"></canvas>
+                </div>
+              </div>
+              <div class="legend">
+                <span><i class="swatch on"></i> 1 = 亮点</span>
+                <span><i class="swatch off"></i> 0 = 暗点</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card bytes-card">
+            <div class="card-head">
+              <h2>打包后的 PROGMEM 字节</h2>
+              <p>每字节 8 个像素，30 像素一行需要 4 字节，共 120 字节</p>
+            </div>
+            <textarea id="bytesOutput" readonly spellcheck="false"></textarea>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -8,7 +8,6 @@
 
 #include <ctype.h>
 #include <math.h>
-#include <stdarg.h>
 #include <string.h>
 
 // --- UART pins ---
@@ -56,12 +55,27 @@ constexpr uint8_t KEY5_MASK = 0x10; // node btn bit0
 constexpr uint32_t LOOP_POLL_PERIOD_US = 22222; // 45Hz
 constexpr uint32_t OUTPUT_PERIOD_US = 34000; // ~29.4Hz
 constexpr uint32_t LINK_TIMEOUT_MS = 500;
+constexpr uint32_t XR_BRIDGE_LINK_TIMEOUT_MS = 500;
 constexpr uint32_t XR_PACKET_MAGIC = 0x31525843u; // "CXR1" little-endian
-constexpr size_t XR_HOST_LINE_MAX = 192;
+constexpr uint32_t XR_BRIDGE_MAGIC = 0x42525843u; // "CXRB" little-endian
+constexpr uint8_t XR_BRIDGE_VERSION = 1;
+constexpr uint8_t XR_BRIDGE_DEVICE_KIND_MASTER = 1;
+constexpr uint8_t XR_BRIDGE_CAP_PAYLOAD_96 = 0x01;
+constexpr uint8_t XR_BRIDGE_CAP_DELTA_ARBITER = 0x02;
+constexpr uint8_t XR_BRIDGE_CAP_CRC16 = 0x04;
+constexpr uint8_t QUICK_KEY_OR_MASK = 0x6F; // KEY1-4, KEY6-7
+constexpr uint8_t OWNER_KEY_MASK = 0x90;    // KEY5, KEY8
+constexpr size_t XR_BRIDGE_MAX_PAYLOAD = 96;
 
-enum InputSourceMode : uint8_t {
-  INPUT_SOURCE_NODE_CHAIN = 0,
-  INPUT_SOURCE_XR_UART = 1,
+enum XrBridgeFrameType : uint8_t {
+  XR_BRIDGE_HELLO_REQ = 1,
+  XR_BRIDGE_HELLO_RSP = 2,
+  XR_BRIDGE_XR_DATA = 3,
+};
+
+enum OutputOwner : uint8_t {
+  OUTPUT_OWNER_NATIVE = 0,
+  OUTPUT_OWNER_XR = 1,
 };
 
 #pragma pack(push, 1)
@@ -95,8 +109,8 @@ struct UnifiedPayload30 {
   uint8_t modeFlags = 0;
   // [23..28] raw encoder angles
   uint16_t encRaw[3] = {0, 0, 0};
-  // [29] reserved
-  uint8_t reserved = 0;
+  // [29] tile menu command pulse, 0 when idle
+  uint8_t tileCmd = 0;
 };
 
 struct XrPosePacketV1 {
@@ -114,12 +128,33 @@ struct XrPosePacketV1 {
   float absEuler[3] = {0.0f, 0.0f, 0.0f};
   float relEuler[3] = {0.0f, 0.0f, 0.0f};
 };
+
+struct XrBridgeFrameHeader {
+  uint32_t magic = XR_BRIDGE_MAGIC;
+  uint8_t version = XR_BRIDGE_VERSION;
+  uint8_t type = XR_BRIDGE_HELLO_REQ;
+  uint16_t payloadLen = 0;
+  uint32_t seq = 0;
+};
+
+struct XrBridgeHelloResponse {
+  uint8_t deviceKind = XR_BRIDGE_DEVICE_KIND_MASTER;
+  uint8_t outputIf = MB_OUTPUT_IF_RS232;
+  uint8_t bridgeReady = 0;
+  uint8_t caps = 0;
+  uint16_t xrPayloadLen = sizeof(XrPosePacketV1);
+  uint16_t reserved = 0;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(UnifiedPayload30) == RM_DATA_LEN,
               "Unified payload must be exactly 30 bytes");
 static_assert(sizeof(XrPosePacketV1) == 96,
               "XR pose packet layout changed unexpectedly");
+static_assert(sizeof(XrBridgeFrameHeader) == 12,
+              "XR bridge header layout changed unexpectedly");
+static_assert(sizeof(XrBridgeHelloResponse) == 8,
+              "XR bridge hello response layout changed unexpectedly");
 
 MahonyFilter mahony;
 Preferences prefs;
@@ -148,7 +183,6 @@ static float sDeltaPos[3] = {0.0f, 0.0f, 0.0f};
 static uint8_t sNodeButtons = 0;
 static uint8_t sLocalKeys = 0;
 static uint8_t sKeyFlags = 0;
-static uint8_t sXrKeyFlags = 0;
 static uint8_t sDeltaKey = 0;
 static uint8_t sJoyX = 50;
 static uint8_t sJoyY = 50;
@@ -165,6 +199,7 @@ static bool sHasWheelSeq = false;
 static int16_t sWheelPos = 0;
 
 static bool sPrevDeltaPressed = false;
+static bool sPrevXrDeltaPressed = false;
 static float sRefQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 static float sRefPos[3] = {0.0f, 0.0f, 0.0f};
 
@@ -206,20 +241,31 @@ static bool sUiPopupSticky = false;
 static uint32_t sUiPopupExpireMs = 0;
 
 static portMUX_TYPE sConfigMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE sTileMenuMux = portMUX_INITIALIZER_UNLOCKED;
+static bool sTileMenuActive = false;
+static uint8_t sTileCommandPulse = 0;
 
-static InputSourceMode sInputSourceMode = INPUT_SOURCE_NODE_CHAIN;
-static bool sXrModeRequested = false;
-static bool sXrRestorePending = false;
+static OutputOwner sOutputOwner = OUTPUT_OWNER_NATIVE;
+static uint8_t sXrKeyFlags = 0;
+static uint8_t sXrJoyX = 50;
+static uint8_t sXrJoyY = 50;
+static uint8_t sXrDeltaKey = 0;
+static int16_t sXrWheelPos = 0;
+static float sXrQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+static float sXrDeltaQuat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+static float sXrAbsEuler[3] = {0.0f, 0.0f, 0.0f};
+static float sXrDeltaEuler[3] = {0.0f, 0.0f, 0.0f};
+static float sXrAbsPos[3] = {0.0f, 0.0f, 0.0f};
+static float sXrDeltaPos[3] = {0.0f, 0.0f, 0.0f};
+static bool sXrHasSample = false;
 static uint32_t sXrLastPacketSeq = 0;
 static uint32_t sXrLastPacketMs = 0;
-static XrWebSnapshot sXrSnapshot;
-static char sHostLineBuf[XR_HOST_LINE_MAX];
-static size_t sHostLineLen = 0;
-static uint8_t sXrPacketBuf[sizeof(XrPosePacketV1)] = {0};
-static size_t sXrPacketLen = 0;
-static bool sXrPacketSync = false;
 
-static void handleHostCommandLine(const char *line);
+static uint8_t sBridgeRxBuf[sizeof(XrBridgeFrameHeader) + XR_BRIDGE_MAX_PAYLOAD +
+                            sizeof(uint16_t)] = {0};
+static size_t sBridgeRxLen = 0;
+static size_t sBridgeExpectedLen = 0;
+static bool sBridgeSync = false;
 
 static float clampf(float x, float lo, float hi) {
   if (x < lo)
@@ -339,26 +385,11 @@ static void resetPoseStateToIdle() {
   sNodeButtons = 0;
   sLocalKeys = 0;
   sKeyFlags = 0;
-  sXrKeyFlags = 0;
   sDeltaKey = 0;
   sJoyX = 50;
   sJoyY = 50;
   sHasSample = false;
   sPrevDeltaPressed = false;
-}
-
-static void sendHostLinef(const char *fmt, ...) {
-  char buf[192];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-  Serial.print(buf);
-  Serial.print('\n');
-}
-
-static const char *xrModeName() {
-  return (sInputSourceMode == INPUT_SOURCE_XR_UART) ? "UART" : "NODE";
 }
 
 // IEEE754 float32 -> float16
@@ -420,6 +451,24 @@ static void updateUiPopupState() {
   portEXIT_CRITICAL(&sUiPopupMux);
 }
 
+static bool isXrBridgeReady() {
+  uint8_t outIf = MB_OUTPUT_IF_RS232;
+  portENTER_CRITICAL(&sConfigMux);
+  outIf = (sOutputInterface == MB_OUTPUT_IF_USB) ? MB_OUTPUT_IF_USB
+                                                 : MB_OUTPUT_IF_RS232;
+  portEXIT_CRITICAL(&sConfigMux);
+  return outIf == MB_OUTPUT_IF_RS232;
+}
+
+static bool isXrLinkActive() {
+  return isXrBridgeReady() && sXrHasSample && sXrLastPacketMs != 0 &&
+         (uint32_t)(millis() - sXrLastPacketMs) <= XR_BRIDGE_LINK_TIMEOUT_MS;
+}
+
+static bool ownerUsesXrPose() {
+  return isXrBridgeReady() && sOutputOwner == OUTPUT_OWNER_XR && sXrHasSample;
+}
+
 static uint8_t getOutputInterfaceUnsafe() {
   return (sOutputInterface == MB_OUTPUT_IF_USB) ? MB_OUTPUT_IF_USB
                                                 : MB_OUTPUT_IF_RS232;
@@ -465,17 +514,43 @@ static uint8_t scanLocalKeys() {
 }
 
 static void updateCombinedKeyFlags() {
-  if (sInputSourceMode == INPUT_SOURCE_XR_UART) {
-    sLocalKeys = scanLocalKeys();
-    sNodeButtons = 0;
-    sKeyFlags = (uint8_t)((sXrKeyFlags & 0xF0u) |
-                          ((sXrKeyFlags | sLocalKeys) & 0x0Fu));
-    sDeltaKey = (sKeyFlags & KEY5_MASK) ? 1 : 0;
-    return;
+  const uint8_t localKeys = scanLocalKeys();
+  bool tileMenuActive = false;
+  portENTER_CRITICAL(&sTileMenuMux);
+  sLocalKeys = localKeys;
+  tileMenuActive = sTileMenuActive;
+  portEXIT_CRITICAL(&sTileMenuMux);
+
+  const uint8_t forwardedLocalKeys = tileMenuActive ? 0U : localKeys;
+  const uint8_t nativeKeyFlags =
+      (uint8_t)((forwardedLocalKeys & 0x0Fu) | ((sNodeButtons & 0x0Fu) << 4));
+  const uint8_t xrKeyFlags = isXrLinkActive() ? sXrKeyFlags : 0U;
+  const bool nativeDeltaPressed = (nativeKeyFlags & KEY5_MASK) != 0;
+  const bool xrDeltaPressed = (xrKeyFlags & KEY5_MASK) != 0;
+  const bool nativeDeltaEdge = nativeDeltaPressed && !sPrevDeltaPressed;
+  const bool xrDeltaEdge = xrDeltaPressed && !sPrevXrDeltaPressed;
+  const bool ownerLocked =
+      (sOutputOwner == OUTPUT_OWNER_NATIVE) ? nativeDeltaPressed : xrDeltaPressed;
+
+  if (!ownerLocked) {
+    if (nativeDeltaEdge) {
+      sOutputOwner = OUTPUT_OWNER_NATIVE;
+    } else if (xrDeltaEdge) {
+      sOutputOwner = OUTPUT_OWNER_XR;
+    }
   }
-  sLocalKeys = scanLocalKeys();
-  sKeyFlags = (uint8_t)((sLocalKeys & 0x0F) | ((sNodeButtons & 0x0F) << 4));
-  sDeltaKey = (sKeyFlags & KEY5_MASK) ? 1 : 0;
+
+  sPrevXrDeltaPressed = xrDeltaPressed;
+
+  const uint8_t ownerKeyFlags =
+      (sOutputOwner == OUTPUT_OWNER_XR) ? xrKeyFlags : nativeKeyFlags;
+  sKeyFlags = (uint8_t)(((nativeKeyFlags | xrKeyFlags) & QUICK_KEY_OR_MASK) |
+                        (ownerKeyFlags & OWNER_KEY_MASK));
+  sDeltaKey =
+      (uint8_t)(((sOutputOwner == OUTPUT_OWNER_XR) ? xrDeltaPressed
+                                                   : nativeDeltaPressed)
+                    ? 1U
+                    : 0U);
 }
 
 static void loadJoystickCalibration() {
@@ -618,7 +693,25 @@ static void saveOutputConfig() {
 }
 
 static void resetXrPoseData() {
-  resetPoseStateToIdle();
+  sXrQuat[0] = 1.0f;
+  sXrQuat[1] = 0.0f;
+  sXrQuat[2] = 0.0f;
+  sXrQuat[3] = 0.0f;
+  sXrDeltaQuat[0] = 1.0f;
+  sXrDeltaQuat[1] = 0.0f;
+  sXrDeltaQuat[2] = 0.0f;
+  sXrDeltaQuat[3] = 0.0f;
+  memset(sXrAbsEuler, 0, sizeof(sXrAbsEuler));
+  memset(sXrDeltaEuler, 0, sizeof(sXrDeltaEuler));
+  memset(sXrAbsPos, 0, sizeof(sXrAbsPos));
+  memset(sXrDeltaPos, 0, sizeof(sXrDeltaPos));
+  sXrKeyFlags = 0;
+  sXrJoyX = 50;
+  sXrJoyY = 50;
+  sXrDeltaKey = 0;
+  sXrWheelPos = 0;
+  sXrHasSample = false;
+  sPrevXrDeltaPressed = false;
   sXrLastPacketSeq = 0;
   sXrLastPacketMs = 0;
 }
@@ -635,26 +728,30 @@ static void fillUnifiedPayload(UnifiedPayload30 &payload) {
   rot = getRotationOutputModeUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
 
-  if (sInputSourceMode == INPUT_SOURCE_XR_UART)
-    outIf = MB_OUTPUT_IF_RS232;
-
   payload.statusErr = composeStatusErr();
   payload.keyFlags = (uint16_t)sKeyFlags;
   payload.deltaKey = sDeltaKey;
-  payload.wheelPos = sWheelPos;
-  payload.joyX = sJoyX;
-  payload.joyY = sJoyY;
+  const bool xrOwner = ownerUsesXrPose();
+  payload.wheelPos = xrOwner ? sXrWheelPos : sWheelPos;
+  payload.joyX = xrOwner ? sXrJoyX : sJoyX;
+  payload.joyY = xrOwner ? sXrJoyY : sJoyY;
 
-  const float *posSrc = (pose == MB_POSE_MODE_ABSOLUTE) ? sAbsPos : sDeltaPos;
+  const float *absPosSrc = xrOwner ? sXrAbsPos : sAbsPos;
+  const float *deltaPosSrc = xrOwner ? sXrDeltaPos : sDeltaPos;
+  const float *absEulerSrc = xrOwner ? sXrAbsEuler : sAbsEuler;
+  const float *deltaEulerSrc = xrOwner ? sXrDeltaEuler : sDeltaEuler;
+  const float *absQuatSrc = xrOwner ? sXrQuat : sQuat;
+  const float *deltaQuatSrc = xrOwner ? sXrDeltaQuat : sDeltaQuat;
+  const float *posSrc = (pose == MB_POSE_MODE_ABSOLUTE) ? absPosSrc : deltaPosSrc;
   const float *eulerSrc =
-      (pose == MB_POSE_MODE_ABSOLUTE) ? sAbsEuler : sDeltaEuler;
+      (pose == MB_POSE_MODE_ABSOLUTE) ? absEulerSrc : deltaEulerSrc;
 
   payload.posH[0] = floatToHalf(posSrc[0]);
   payload.posH[1] = floatToHalf(posSrc[1]);
   payload.posH[2] = floatToHalf(posSrc[2]);
 
   if (rot == MB_ROT_OUT_QUATERNION) {
-    const float *quatSrc = (pose == MB_POSE_MODE_ABSOLUTE) ? sQuat : sDeltaQuat;
+    const float *quatSrc = (pose == MB_POSE_MODE_ABSOLUTE) ? absQuatSrc : deltaQuatSrc;
     payload.eulerH[0] = floatToHalf(quatSrc[0]);
     payload.eulerH[1] = floatToHalf(quatSrc[1]);
     payload.eulerH[2] = floatToHalf(quatSrc[2]);
@@ -674,7 +771,7 @@ static void fillUnifiedPayload(UnifiedPayload30 &payload) {
   if (rot == MB_ROT_OUT_QUATERNION)
     payload.modeFlags |= 0x04;
 
-  if (sInputSourceMode == INPUT_SOURCE_XR_UART) {
+  if (xrOwner) {
     payload.encRaw[0] = 0;
     payload.encRaw[1] = 0;
     payload.encRaw[2] = 0;
@@ -683,7 +780,11 @@ static void fillUnifiedPayload(UnifiedPayload30 &payload) {
     payload.encRaw[1] = sEncCalRaw[1];
     payload.encRaw[2] = sEncCalRaw[2];
   }
-  payload.reserved = 0;
+
+  portENTER_CRITICAL(&sTileMenuMux);
+  payload.tileCmd = sTileCommandPulse;
+  sTileCommandPulse = 0;
+  portEXIT_CRITICAL(&sTileMenuMux);
 }
 
 static void sendUnifiedFrame() {
@@ -722,9 +823,6 @@ static void sendUnifiedFrame() {
   outIf = getOutputInterfaceUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
 
-  if (sInputSourceMode == INPUT_SOURCE_XR_UART)
-    outIf = MB_OUTPUT_IF_RS232;
-
   if (outIf == MB_OUTPUT_IF_USB)
     Serial.write(frame, off);
   else
@@ -748,35 +846,40 @@ static void publishMonitorSnapshot() {
   snap.enc[1] = sEncCalRaw[1];
   snap.enc[2] = sEncCalRaw[2];
 
-  snap.quat[0] = sQuat[0];
-  snap.quat[1] = sQuat[1];
-  snap.quat[2] = sQuat[2];
-  snap.quat[3] = sQuat[3];
+  const bool xrOwner = ownerUsesXrPose();
+  const float *absQuatSrc = xrOwner ? sXrQuat : sQuat;
+  const float *absEulerSrc = xrOwner ? sXrAbsEuler : sAbsEuler;
+  const float *deltaEulerSrc = xrOwner ? sXrDeltaEuler : sDeltaEuler;
+  const float *absPosSrc = xrOwner ? sXrAbsPos : sAbsPos;
+  const float *deltaPosSrc = xrOwner ? sXrDeltaPos : sDeltaPos;
 
-  snap.absEuler[0] = sAbsEuler[0];
-  snap.absEuler[1] = sAbsEuler[1];
-  snap.absEuler[2] = sAbsEuler[2];
-  snap.deltaEuler[0] = sDeltaEuler[0];
-  snap.deltaEuler[1] = sDeltaEuler[1];
-  snap.deltaEuler[2] = sDeltaEuler[2];
+  snap.quat[0] = absQuatSrc[0];
+  snap.quat[1] = absQuatSrc[1];
+  snap.quat[2] = absQuatSrc[2];
+  snap.quat[3] = absQuatSrc[3];
 
-  snap.absPos[0] = sAbsPos[0];
-  snap.absPos[1] = sAbsPos[1];
-  snap.absPos[2] = sAbsPos[2];
-  snap.deltaPos[0] = sDeltaPos[0];
-  snap.deltaPos[1] = sDeltaPos[1];
-  snap.deltaPos[2] = sDeltaPos[2];
+  snap.absEuler[0] = absEulerSrc[0];
+  snap.absEuler[1] = absEulerSrc[1];
+  snap.absEuler[2] = absEulerSrc[2];
+  snap.deltaEuler[0] = deltaEulerSrc[0];
+  snap.deltaEuler[1] = deltaEulerSrc[1];
+  snap.deltaEuler[2] = deltaEulerSrc[2];
+
+  snap.absPos[0] = absPosSrc[0];
+  snap.absPos[1] = absPosSrc[1];
+  snap.absPos[2] = absPosSrc[2];
+  snap.deltaPos[0] = deltaPosSrc[0];
+  snap.deltaPos[1] = deltaPosSrc[1];
+  snap.deltaPos[2] = deltaPosSrc[2];
 
   snap.keyFlags = sKeyFlags;
   snap.deltaKey = sDeltaKey;
-  snap.wheelPos = sWheelPos;
-  snap.joyX = sJoyX;
-  snap.joyY = sJoyY;
+  snap.wheelPos = xrOwner ? sXrWheelPos : sWheelPos;
+  snap.joyX = xrOwner ? sXrJoyX : sJoyX;
+  snap.joyY = xrOwner ? sXrJoyY : sJoyY;
 
   portENTER_CRITICAL(&sConfigMux);
-  snap.outputInterface = (sInputSourceMode == INPUT_SOURCE_XR_UART)
-                             ? MB_OUTPUT_IF_RS232
-                             : getOutputInterfaceUnsafe();
+  snap.outputInterface = getOutputInterfaceUnsafe();
   snap.poseMode = getPoseModeUnsafe();
   portEXIT_CRITICAL(&sConfigMux);
 
@@ -784,7 +887,7 @@ static void publishMonitorSnapshot() {
   snap.disconnectNodeKnown = sDisconnectNodeKnown ? 1 : 0;
   snap.disconnectNodeId = sDisconnectNodeId;
   snap.lossRate10s = sLossRate10s;
-  snap.valid = sSystemReady ? 1 : 0;
+  snap.valid = (sSystemReady || sXrHasSample) ? 1 : 0;
 
   portENTER_CRITICAL(&sMonitorSnapshotMux);
   sMonitorSnapshot = snap;
@@ -818,6 +921,9 @@ static void exitDisconnectMode() {
     setUiPopup("Conn restored", false, 1500);
 }
 
+static void processHostSerialInput(int maxLoops = 192);
+static inline void serviceHostBridgeDuringWait();
+
 static bool tryInitHandshake(uint32_t timeoutMs) {
   uint8_t addrPayload[] = {CMD_ADDR_RESET, 0, 0, 0};
   uint8_t crc = calcCRC8(addrPayload, 4);
@@ -832,8 +938,10 @@ static bool tryInitHandshake(uint32_t timeoutMs) {
   int idx = 0;
   uint32_t startMs = millis();
   while ((uint32_t)(millis() - startMs) < timeoutMs) {
-    if (!Serial1.available())
+    if (!Serial1.available()) {
+      serviceHostBridgeDuringWait();
       continue;
+    }
     uint8_t b = (uint8_t)Serial1.read();
     if (idx == 0 && b != CMD_ADDR_RESET)
       continue;
@@ -869,294 +977,187 @@ static void resetSampleCache() {
   sNodeButtons = 0;
 }
 
-static void refreshXrSnapshot() {
-  memset(&sXrSnapshot, 0, sizeof(sXrSnapshot));
-  sXrSnapshot.enabled = (sInputSourceMode == INPUT_SOURCE_XR_UART) ? 1 : 0;
-  sXrSnapshot.hasPose = sHasSample ? 1 : 0;
-  sXrSnapshot.restorePending = sXrRestorePending ? 1 : 0;
-  sXrSnapshot.hostLinked =
-      (sXrLastPacketMs != 0 &&
-       (uint32_t)(millis() - sXrLastPacketMs) <= LINK_TIMEOUT_MS)
-          ? 1
-          : 0;
-  sXrSnapshot.lastPacketSeq = sXrLastPacketSeq;
-  sXrSnapshot.lastPacketAgeMs =
-      sXrLastPacketMs ? (uint32_t)(millis() - sXrLastPacketMs) : 0;
-}
-
-static void sendXrStatusLine() {
-  refreshXrSnapshot();
-  sendHostLinef(
-      "@XR STATUS mode=%s requested=%u link=%u has_pose=%u restore=%u seq=%lu "
-      "age_ms=%lu",
-      xrModeName(), sXrModeRequested ? 1u : 0u,
-      (unsigned)sXrSnapshot.hostLinked, (unsigned)sXrSnapshot.hasPose,
-      (unsigned)sXrSnapshot.restorePending,
-      (unsigned long)sXrSnapshot.lastPacketSeq,
-      (unsigned long)sXrSnapshot.lastPacketAgeMs);
-}
-
 static void applyXrPosePacket(const XrPosePacketV1 &packet) {
-  sXrLastPacketSeq = packet.seq;
-  sXrLastPacketMs = millis();
-  sLastValidFrameMs = sXrLastPacketMs;
-  sObservedEnc = 0;
-  sObservedHnd = 0;
-  sTopoError = false;
-  sDisconnectMode = false;
-  sDisconnectNodeKnown = false;
-  sDisconnectNodeId = 0xFF;
-  sSystemReady = true;
-  sLastErrFlags = 0;
-
   if ((packet.flags & 0x0001u) == 0) {
     return;
   }
 
-  sHasSample = true;
-  sJoyX = packet.joyX;
-  sJoyY = packet.joyY;
+  sXrLastPacketSeq = packet.seq;
+  sXrLastPacketMs = millis();
+  sXrHasSample = true;
+  sXrJoyX = packet.joyX;
+  sXrJoyY = packet.joyY;
   sXrKeyFlags = (uint8_t)(packet.keyFlags & 0xFFu);
+  sXrDeltaKey = (sXrKeyFlags & KEY5_MASK) ? 1U : 0U;
+  sXrWheelPos = 0;
+
+  memcpy(sXrAbsPos, packet.absPos, sizeof(sXrAbsPos));
+  memcpy(sXrDeltaPos, packet.relPos, sizeof(sXrDeltaPos));
+  memcpy(sXrQuat, packet.absQuat, sizeof(sXrQuat));
+  memcpy(sXrDeltaQuat, packet.relQuat, sizeof(sXrDeltaQuat));
+  memcpy(sXrAbsEuler, packet.absEuler, sizeof(sXrAbsEuler));
+  memcpy(sXrDeltaEuler, packet.relEuler, sizeof(sXrDeltaEuler));
+  normalizeQuat(sXrQuat);
+  normalizeQuat(sXrDeltaQuat);
   updateCombinedKeyFlags();
-  sWheelPos = 0;
-
-  memcpy(sAbsPos, packet.absPos, sizeof(sAbsPos));
-  memcpy(sDeltaPos, packet.relPos, sizeof(sDeltaPos));
-  memcpy(sQuat, packet.absQuat, sizeof(sQuat));
-  memcpy(sDeltaQuat, packet.relQuat, sizeof(sDeltaQuat));
-  memcpy(sAbsEuler, packet.absEuler, sizeof(sAbsEuler));
-  memcpy(sDeltaEuler, packet.relEuler, sizeof(sDeltaEuler));
-  normalizeQuat(sQuat);
-  normalizeQuat(sDeltaQuat);
 }
 
-static void resetXrSerialParser() {
-  sHostLineLen = 0;
-  sXrPacketLen = 0;
-  sXrPacketSync = false;
-}
-
-static void consumeHostAsciiByte(char ch) {
-  if (sHostLineLen == 0) {
-    if (ch != '@')
-      return;
-    sHostLineBuf[sHostLineLen++] = ch;
-    return;
-  }
-
-  if (ch == '\r')
-    return;
-
-  if (ch == '\n') {
-    sHostLineBuf[sHostLineLen] = '\0';
-    handleHostCommandLine(sHostLineBuf);
-    sHostLineLen = 0;
-    return;
-  }
-
-  if ((unsigned char)ch < 32 || (unsigned char)ch > 126) {
-    sHostLineLen = 0;
-    return;
-  }
-
-  if (sHostLineLen + 1 >= sizeof(sHostLineBuf)) {
-    sHostLineLen = 0;
-    return;
-  }
-
-  sHostLineBuf[sHostLineLen++] = ch;
-}
-
-static void consumeXrPacketByte(uint8_t byteValue) {
-  if (!sXrPacketSync) {
-    sXrPacketBuf[sXrPacketLen++] = byteValue;
-    if (sXrPacketLen >= 4) {
-      uint32_t maybeMagic;
-      memcpy(&maybeMagic, sXrPacketBuf + sXrPacketLen - 4, 4);
-      if (maybeMagic == XR_PACKET_MAGIC) {
-        sXrPacketSync = true;
-        sXrPacketLen = 4;
-        return;
-      }
-      // 没有匹配到完整的CXR1，滑动窗口，丢弃最老的一字节
-      sXrPacketBuf[0] = sXrPacketBuf[1];
-      sXrPacketBuf[1] = sXrPacketBuf[2];
-      sXrPacketBuf[2] = sXrPacketBuf[3];
-      sXrPacketLen = 3;
-    }
-    return;
-  }
-
-  if (sXrPacketLen >= sizeof(sXrPacketBuf)) {
-    // 【修复点 1】：发生缓冲区越界时，仅丢弃错位数据并退出同步状态
-    // 取消原有的 sLastErrFlags = ERR_PARSE;
-    // 赋值，避免下游硬件收到错误码导致归零
-    sXrPacketSync = false;
-    sXrPacketLen = 0;
-    return;
-  }
-
-  sXrPacketBuf[sXrPacketLen++] = byteValue;
-  if (sXrPacketLen < sizeof(XrPosePacketV1))
-    return;
-
-  XrPosePacketV1 packet;
-  memcpy(&packet, sXrPacketBuf, sizeof(packet));
-  sXrPacketSync = false;
-  sXrPacketLen = 0;
-
-  // 1. 基础包头校验 (只能防错包，防不了中途错位)
+static bool validateXrPosePacket(const XrPosePacketV1 &packet) {
   if (packet.magic != XR_PACKET_MAGIC || packet.version != 1) {
-    return;
+    return false;
   }
-
-  // === 新增：防物理层丢字节的“数学启发式结构校验” ===
-
-  // 启发式校验 A：摇杆物理边界 (正常为 0-100，一旦错位极易读出极大数据)
   if (packet.joyX > 100 || packet.joyY > 100) {
-    return; // 静默丢弃错位包，维持上一个正常姿态
+    return false;
   }
 
-  // 启发式校验 B：四元数几何模长校验（最核心的防错位防线）
-  // 正常的四元数模长平方必定在 1.0 附近，错位的乱码大概率为极大、极小或 NaN
   auto checkQuat = [](const float q[4]) -> bool {
     float sum = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
-    return (!isnan(sum) && sum > 0.8f && sum < 1.2f);
+    return !isnan(sum) && sum > 0.8f && sum < 1.2f;
   };
-
-  if (!checkQuat(packet.absQuat) || !checkQuat(packet.relQuat)) {
-    return; // 四元数非规格化，100% 发生了底层通信错位
-  }
-
-  // 启发式校验 C：基础向量非 NaN 校验
   auto checkVec = [](const float v[3]) -> bool {
-    return (!isnan(v[0]) && !isnan(v[1]) && !isnan(v[2]));
+    return !isnan(v[0]) && !isnan(v[1]) && !isnan(v[2]);
   };
 
-  if (!checkVec(packet.absPos) || !checkVec(packet.relPos) ||
-      !checkVec(packet.absEuler) || !checkVec(packet.relEuler)) {
+  return checkQuat(packet.absQuat) && checkQuat(packet.relQuat) &&
+         checkVec(packet.absPos) && checkVec(packet.relPos) &&
+         checkVec(packet.absEuler) && checkVec(packet.relEuler);
+}
+
+static void writeBridgeFrame(uint8_t type, uint32_t seq, const void *payload,
+                             size_t payloadLen) {
+  if (payloadLen > XR_BRIDGE_MAX_PAYLOAD) {
     return;
   }
-  // ===================================================
 
-  // 只有通过了严格数学属性校验的绝对健康数据，才会放行并刷新全局状态
+  XrBridgeFrameHeader header;
+  header.type = type;
+  header.payloadLen = (uint16_t)payloadLen;
+  header.seq = seq;
+
+  uint8_t frame[sizeof(XrBridgeFrameHeader) + XR_BRIDGE_MAX_PAYLOAD +
+                sizeof(uint16_t)] = {0};
+  size_t offset = 0;
+  memcpy(frame + offset, &header, sizeof(header));
+  offset += sizeof(header);
+  if (payload != nullptr && payloadLen > 0) {
+    memcpy(frame + offset, payload, payloadLen);
+    offset += payloadLen;
+  }
+
+  const uint16_t crc16 = rm_crc16(frame, offset);
+  frame[offset++] = (uint8_t)(crc16 & 0xFFu);
+  frame[offset++] = (uint8_t)((crc16 >> 8) & 0xFFu);
+  Serial.write(frame, offset);
+}
+
+static void sendBridgeHelloResponse(uint32_t seq) {
+  XrBridgeHelloResponse payload;
+  payload.outputIf = getOutputInterfaceUnsafe();
+  payload.bridgeReady = isXrBridgeReady() ? 1U : 0U;
+  payload.caps =
+      (uint8_t)(XR_BRIDGE_CAP_PAYLOAD_96 | XR_BRIDGE_CAP_DELTA_ARBITER |
+                XR_BRIDGE_CAP_CRC16);
+  payload.xrPayloadLen = (uint16_t)sizeof(XrPosePacketV1);
+  writeBridgeFrame(XR_BRIDGE_HELLO_RSP, seq, &payload, sizeof(payload));
+}
+
+static void dispatchBridgeFrame(const XrBridgeFrameHeader &header,
+                                const uint8_t *payload) {
+  if (header.type == XR_BRIDGE_HELLO_REQ) {
+    sendBridgeHelloResponse(header.seq);
+    return;
+  }
+
+  if (header.type != XR_BRIDGE_XR_DATA || !isXrBridgeReady() ||
+      header.payloadLen != sizeof(XrPosePacketV1) || payload == nullptr) {
+    return;
+  }
+
+  XrPosePacketV1 packet;
+  memcpy(&packet, payload, sizeof(packet));
+  if (!validateXrPosePacket(packet)) {
+    return;
+  }
   applyXrPosePacket(packet);
 }
 
-static void processHostSerialInput() {
+static void resetBridgeParser() {
+  sBridgeRxLen = 0;
+  sBridgeExpectedLen = 0;
+  sBridgeSync = false;
+}
+
+static void consumeBridgeByte(uint8_t byteValue) {
+  if (!sBridgeSync) {
+    sBridgeRxBuf[sBridgeRxLen++] = byteValue;
+    if (sBridgeRxLen >= 4) {
+      uint32_t maybeMagic = 0;
+      memcpy(&maybeMagic, sBridgeRxBuf + sBridgeRxLen - 4, 4);
+      if (maybeMagic == XR_BRIDGE_MAGIC) {
+        sBridgeSync = true;
+        memcpy(sBridgeRxBuf, sBridgeRxBuf + sBridgeRxLen - 4, 4);
+        sBridgeRxLen = 4;
+        return;
+      }
+      sBridgeRxBuf[0] = sBridgeRxBuf[sBridgeRxLen - 3];
+      sBridgeRxBuf[1] = sBridgeRxBuf[sBridgeRxLen - 2];
+      sBridgeRxBuf[2] = sBridgeRxBuf[sBridgeRxLen - 1];
+      sBridgeRxLen = 3;
+    }
+    return;
+  }
+
+  if (sBridgeRxLen >= sizeof(sBridgeRxBuf)) {
+    resetBridgeParser();
+    return;
+  }
+
+  sBridgeRxBuf[sBridgeRxLen++] = byteValue;
+  if (sBridgeRxLen == sizeof(XrBridgeFrameHeader)) {
+    XrBridgeFrameHeader header;
+    memcpy(&header, sBridgeRxBuf, sizeof(header));
+    if (header.magic != XR_BRIDGE_MAGIC ||
+        header.version != XR_BRIDGE_VERSION ||
+        header.payloadLen > XR_BRIDGE_MAX_PAYLOAD) {
+      resetBridgeParser();
+      return;
+    }
+    sBridgeExpectedLen =
+        sizeof(XrBridgeFrameHeader) + (size_t)header.payloadLen + sizeof(uint16_t);
+  }
+
+  if (sBridgeExpectedLen == 0 || sBridgeRxLen < sBridgeExpectedLen) {
+    return;
+  }
+
+  const uint16_t recvCrc =
+      (uint16_t)sBridgeRxBuf[sBridgeExpectedLen - 2] |
+      ((uint16_t)sBridgeRxBuf[sBridgeExpectedLen - 1] << 8);
+  const uint16_t calcCrc = rm_crc16(sBridgeRxBuf, sBridgeExpectedLen - 2);
+  if (recvCrc == calcCrc) {
+    XrBridgeFrameHeader header;
+    memcpy(&header, sBridgeRxBuf, sizeof(header));
+    const uint8_t *payload = sBridgeRxBuf + sizeof(XrBridgeFrameHeader);
+    dispatchBridgeFrame(header, payload);
+  }
+  resetBridgeParser();
+}
+
+static void processHostSerialInput(int maxLoops) {
   int loops = 0;
-  // 限制每次最多处理的字节数，防止长时间阻塞30Hz循环
-  while (Serial.available() > 0 && loops < 128) {
+  while (Serial.available() > 0 && loops < maxLoops) {
     int value = Serial.read();
     loops++;
-    if (value < 0)
+    if (value < 0) {
       break;
-
-    uint8_t byteValue = (uint8_t)value;
-    if (sHostLineLen != 0) {
-      consumeHostAsciiByte((char)byteValue);
-      continue;
     }
-
-    bool allowAsciiStart = (byteValue == (uint8_t)'@');
-    if (allowAsciiStart && sInputSourceMode == INPUT_SOURCE_XR_UART) {
-      // In XR-UART mode, raw pose packets can legitimately contain 0x40
-      // inside the binary payload (for example KEY7 == 0x40). Only treat '@'
-      // as an ASCII command start when the XR packet parser is at a clean
-      // packet boundary, otherwise keep feeding the binary parser.
-      allowAsciiStart = (!sXrPacketSync && sXrPacketLen == 0);
-    }
-
-    if (allowAsciiStart) {
-      consumeHostAsciiByte((char)byteValue);
-      continue;
-    }
-
-    if (sInputSourceMode == INPUT_SOURCE_XR_UART)
-      consumeXrPacketByte(byteValue);
+    consumeBridgeByte((uint8_t)value);
   }
 }
 
-static void serviceXrTransport() {
-  if (sInputSourceMode != INPUT_SOURCE_XR_UART || !sXrModeRequested)
-    return;
-
-  // 如果超过了LINK_TIMEOUT_MS没有收到新的数据帧，不将标志位置为报错
-  // 这确保了在硬件侧，如果XR端有卡顿，仍然可以不停地以30Hz下发上一个有效值
-  if (sHasSample &&
-      (uint32_t)(millis() - sLastValidFrameMs) > LINK_TIMEOUT_MS) {
-    // 仅仅在这里可以记录一下状态，我们保留sLastErrFlags不被置为ERR_TIMEOUT
-    // 硬件就不会因为收到故障标志而归0
-  }
-}
-
-static bool enterXrWebMode() {
-  sInputSourceMode = INPUT_SOURCE_XR_UART;
-  sXrModeRequested = true;
-  sXrRestorePending = false;
-  sSystemReady = true;
-  sTopoError = false;
-  sDisconnectMode = false;
-  sDisconnectNodeKnown = false;
-  sDisconnectNodeId = 0xFF;
-  sLastErrFlags = 0;
-  resetSampleCache();
-  resetXrPoseData();
-  resetXrSerialParser();
-  setUiPopup("XR-UART ON", false, 1200);
-  sendHostLinef("@XR OK mode=UART");
-  return true;
-}
-
-static bool leaveXrWebMode() {
-  if (sInputSourceMode != INPUT_SOURCE_XR_UART && !sXrModeRequested)
-    return true;
-
-  sXrModeRequested = false;
-  sInputSourceMode = INPUT_SOURCE_NODE_CHAIN;
-  resetXrSerialParser();
-  resetXrPoseData();
-  resetSampleCache();
-  sXrRestorePending = true;
-  sLastErrFlags = 0;
-  sSystemReady = false;
-  sTopoError = false;
-
-  if (tryInitHandshake(300)) {
-    exitDisconnectMode();
-    sXrRestorePending = false;
-  } else {
-    enterDisconnectMode(false, 0xFF);
-  }
-
-  setUiPopup("XR-UART OFF", false, 1200);
-  sendHostLinef("@XR OK mode=NODE");
-  return true;
-}
-
-static void handleHostCommandLine(const char *line) {
-  if (!line || strncmp(line, "@XR ", 4) != 0)
-    return;
-
-  const char *cmd = line + 4;
-  if (strcmp(cmd, "STATUS") == 0) {
-    sendXrStatusLine();
-    return;
-  }
-
-  if (strcmp(cmd, "XR_ON") == 0) {
-    if (!enterXrWebMode())
-      sendHostLinef("@XR ERROR reason=enter_failed");
-    return;
-  }
-
-  if (strcmp(cmd, "XR_OFF") == 0) {
-    if (!leaveXrWebMode())
-      sendHostLinef("@XR ERROR reason=exit_failed");
-    return;
-  }
-
-  sendHostLinef("@XR ERROR reason=unknown_command");
+static inline void serviceHostBridgeDuringWait() {
+  processHostSerialInput(512);
+  delayMicroseconds(50);
 }
 
 static void master_business_setup() {
@@ -1178,8 +1179,10 @@ static void master_business_setup() {
   loadEncoderCalibration();
   loadOutputConfig();
 
+  resetPoseStateToIdle();
   resetSampleCache();
   resetXrPoseData();
+  resetBridgeParser();
   updateCombinedKeyFlags();
 
   sLastPollUs = micros();
@@ -1335,7 +1338,7 @@ static void processValidBusPacket(uint8_t *rxBuf, int rxIdx) {
     quatToEulerDeg(sQuat, sAbsEuler[0], sAbsEuler[1], sAbsEuler[2]);
     computeEndEffectorPos(sEncCalRaw, sAbsPos);
 
-    bool deltaPressed = (sDeltaKey != 0);
+    bool deltaPressed = (sNodeButtons & 0x01u) != 0;
     if (deltaPressed && !sPrevDeltaPressed) {
       sRefQuat[0] = sQuat[0];
       sRefQuat[1] = sQuat[1];
@@ -1387,45 +1390,19 @@ static void master_business_loop() {
   updateCombinedKeyFlags();
   updateUiPopupState();
 
-  if (sInputSourceMode == INPUT_SOURCE_XR_UART) {
-    serviceXrTransport();
-
-    uint32_t nowUs = micros();
-    if ((uint32_t)(nowUs - sLastOutputUs) >= OUTPUT_PERIOD_US) {
-      sLastOutputUs += OUTPUT_PERIOD_US;
-      if ((uint32_t)(nowUs - sLastOutputUs) >= OUTPUT_PERIOD_US)
-        sLastOutputUs = nowUs;
-      sendUnifiedFrame();
-    }
-
-    // XR-UART模式下，跳过频繁快照上报，也不强行delay
-    static uint32_t sLastSnapshotMs = 0;
-    if (millis() - sLastSnapshotMs >= 200) {
-      publishMonitorSnapshot();
-      sLastSnapshotMs = millis();
-    }
-
-    // 让出一点时间片给后台，但不强制延时1ms，保证30Hz的精准度
-    taskYIELD();
-    return;
-  }
-
   if (sDisconnectMode || !sSystemReady) {
     if ((uint32_t)(millis() - sLastInitRetryMs) >= 500U) {
       sLastInitRetryMs = millis();
       if (tryInitHandshake(80)) {
         exitDisconnectMode();
-        sXrRestorePending = false;
       }
     }
-    publishMonitorSnapshot();
-    delay(2);
-    return;
   }
 
   uint32_t nowUs = micros();
   bool doPoll = false;
-  if ((uint32_t)(nowUs - sLastPollUs) >= LOOP_POLL_PERIOD_US) {
+  if (!sDisconnectMode && sSystemReady &&
+      (uint32_t)(nowUs - sLastPollUs) >= LOOP_POLL_PERIOD_US) {
     sLastPollUs += LOOP_POLL_PERIOD_US;
     if ((uint32_t)(nowUs - sLastPollUs) >= LOOP_POLL_PERIOD_US)
       sLastPollUs = nowUs;
@@ -1450,8 +1427,10 @@ static void master_business_loop() {
     uint8_t firstCmd = 0;
 
     while (micros() - rxStart < 8000) {
-      if (!Serial1.available())
+      if (!Serial1.available()) {
+        serviceHostBridgeDuringWait();
         continue;
+      }
 
       uint8_t b = (uint8_t)Serial1.read();
       if (rxIdx == 0) {
@@ -1512,8 +1491,7 @@ static void master_business_loop() {
     }
 
     if (gotDisconnectReport) {
-      publishMonitorSnapshot();
-      return;
+      doPoll = false;
     }
 
     if (crcOk) {
@@ -1524,13 +1502,6 @@ static void master_business_loop() {
   if (!sDisconnectMode &&
       (uint32_t)(millis() - sLastValidFrameMs) > LINK_TIMEOUT_MS) {
     enterDisconnectMode(false, 0xFF);
-    publishMonitorSnapshot();
-    return;
-  }
-
-  if (sDisconnectMode) {
-    publishMonitorSnapshot();
-    return;
   }
 
   nowUs = micros();
@@ -1539,11 +1510,14 @@ static void master_business_loop() {
     if ((uint32_t)(nowUs - sLastOutputUs) >= OUTPUT_PERIOD_US)
       sLastOutputUs = nowUs;
 
-    if (sHasSample)
+    const bool hasOutputSample = ownerUsesXrPose() ? sXrHasSample : sHasSample;
+    if (hasOutputSample)
       sendUnifiedFrame();
   }
 
   publishMonitorSnapshot();
+  if (sDisconnectMode || !sSystemReady)
+    delay(2);
 }
 
 namespace MasterBusiness {
@@ -1568,17 +1542,41 @@ bool getUiPopupState(UiPopupState &out) {
   return out.active != 0;
 }
 
-bool getXrWebSnapshot(XrWebSnapshot &out) {
-  refreshXrSnapshot();
-  out = sXrSnapshot;
-  return out.enabled != 0;
+uint8_t getLocalKeyMaskRaw() {
+  uint8_t localKeys = 0;
+  portENTER_CRITICAL(&sTileMenuMux);
+  localKeys = sLocalKeys;
+  portEXIT_CRITICAL(&sTileMenuMux);
+  return (uint8_t)(localKeys & 0x0F);
 }
 
-bool setXrWebMode(bool enabled) {
-  return enabled ? enterXrWebMode() : leaveXrWebMode();
+bool setTileMenuActive(bool active) {
+  portENTER_CRITICAL(&sTileMenuMux);
+  sTileMenuActive = active;
+  if (!active) {
+    sTileCommandPulse = 0;
+  }
+  portEXIT_CRITICAL(&sTileMenuMux);
+  return true;
 }
 
-bool getXrWebMode() { return sInputSourceMode == INPUT_SOURCE_XR_UART; }
+bool getTileMenuActive() {
+  bool active = false;
+  portENTER_CRITICAL(&sTileMenuMux);
+  active = sTileMenuActive;
+  portEXIT_CRITICAL(&sTileMenuMux);
+  return active;
+}
+
+bool triggerTileMenuCommand(uint8_t command) {
+  if (command == 0U) {
+    return false;
+  }
+  portENTER_CRITICAL(&sTileMenuMux);
+  sTileCommandPulse = command;
+  portEXIT_CRITICAL(&sTileMenuMux);
+  return true;
+}
 
 void startJoystickCalibration() {
   sJoyCalActive = true;
